@@ -1479,6 +1479,9 @@ class DatasetConfig:
     frac_or_num_samples: Optional[Union[int, float]] = None
     original_dataset_size: Optional[int] = None
     is_upsampled: bool = False
+    
+    # For debugging / inspection purposes
+    debug_mode: bool = False
 
     def __post_init__(self):
         # if the file exists locally, use the local file
@@ -1562,6 +1565,10 @@ def get_dataset_v1(dc: DatasetConfig, tc: TokenizerConfig):
         num_proc=num_proc,
         desc=f"Adding dataset source field for {dc.dataset_name}",
     )
+    # Subsample the dataset for faster prototyping
+    if dc.debug_mode:
+        print("Debug mode is ON, subsampling dataset to 1000 examples")
+        dataset = dataset.select(range(1000))
     for fn_name, fn_args in zip(dc.transform_fn, dc.transform_fn_args):
         fn, fn_type = TRANSFORM_FNS[fn_name]
         # always pass in tokenizer and other args if needed
@@ -1821,6 +1828,8 @@ def load_dataset_configs(
     transform_fn_args: List[Dict[str, Any]],
     target_columns: Optional[List[str]] = None,
     dataset_config_seed: int = 42,
+    *,
+    debug_mode: bool = False,
 ) -> List[DatasetConfig]:
     dcs = []
     if len(dataset_mixer_list_splits) == 1:
@@ -1855,6 +1864,7 @@ def load_dataset_configs(
             target_columns=target_columns,
             frac_or_num_samples=frac_or_num_samples,
             dataset_config_seed=dataset_config_seed,
+            debug_mode=debug_mode,
         )
 
         original_size = len(dataset_config.dataset)
@@ -1886,6 +1896,8 @@ def get_cached_dataset_tulu_with_statistics(
     drop_dataset_source: bool = True,
     dataset_config_seed: int = 42,
     system_prompt_override: Optional[str] = None,
+    *,
+    debug_mode: bool = False,
 ) -> Union[Dataset, Tuple[Dataset, Dict[str, Any]]]:
     if dataset_config_hash is None:
         dcs = load_dataset_configs(
@@ -1895,6 +1907,7 @@ def get_cached_dataset_tulu_with_statistics(
             transform_fn_args,
             target_columns,
             dataset_config_seed,
+            debug_mode=debug_mode,
         )
         dataset_config_hash = compute_config_hash(dcs, tc)
     else:
