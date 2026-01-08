@@ -165,6 +165,9 @@ class ConvertSFTDataArguments:
     """Only write the tokenizer config to the output directory"""
     tokenizer_config_only: bool = field(default=False)
 
+    """Run debug mode which caps the number of remote dataset files being loaded."""
+    debug_mode: bool = field(default=False)
+
     """Resume from checkpoint if available"""
     resume: bool = field(default=False)
 
@@ -222,6 +225,8 @@ def main(args: ConvertSFTDataArguments, tc: TokenizerConfig):
         ("sft_tulu_filter_v1", {}),  # remove examples that don't have any labels
     ]
 
+    print("Getting dataset...")
+
     train_dataset, dataset_statistics = get_cached_dataset_tulu_with_statistics(
         dataset_mixer_list=args.dataset_mixer_list,
         dataset_mixer_list_splits=args.dataset_mixer_list_splits,
@@ -234,6 +239,7 @@ def main(args: ConvertSFTDataArguments, tc: TokenizerConfig):
         dataset_local_cache_dir=args.dataset_local_cache_dir,
         dataset_skip_cache=args.dataset_skip_cache,
         drop_dataset_source=False,
+        debug_mode=args.debug_mode,
     )
 
     # Use fixed seed for reproducible shuffling (required for resume)
