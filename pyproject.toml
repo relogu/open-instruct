@@ -17,18 +17,19 @@ dependencies = [
     "matplotlib>=3.9.3",
     "multiprocess<0.70.18", # avoid AttributeError in ResourceTracker.__del__
     "nltk>=3.9.1",
-    "numpy>=2",
-    "ai2-olmo-core==2.3.0",
+    "numpy<2",
+    "ai2-olmo-core>=2.4.0",
     "nvitop>=1.4.2",
     "packaging>=24.2",
     "peft>=0.13.2",
     "ray[default]>=2.49.2",
     "setuptools>=75.6.0,<80.0.0",
     "tensorboard>=2.18.0",
-    "torch>=2.9.0,<2.10",
-    "transformers>=4.57.0",
-    "vllm==0.14.1; platform_system != 'Darwin'",
-    "wandb==0.23.1",
+    "torch>=2.8.0,<2.9; platform_system != 'Darwin'",
+    "torch>=2.7.0,<2.9; platform_system == 'Darwin'",
+    "transformers>=4.57.3,<=4.57.3",
+    "vllm==0.11.0; platform_system != 'Darwin'",
+    "wandb>=0.18.1",
     "langdetect==1.0.9",
     "immutabledict==1.2.0",
     "flash-attn>=2.8.3; platform_system != 'Darwin' and platform_machine != 'aarch64'",
@@ -56,18 +57,12 @@ flash-attn = { FLASH_ATTENTION_SKIP_CUDA_BUILD = "TRUE" }
 # pytorch related setups
 [tool.uv.sources]
 torch = [
-  { index = "pytorch-cu129", marker = "platform_system == 'Linux' and platform_machine != 'aarch64'"},
-  { index = "pytorch-cu130", marker = "platform_system == 'Linux' and platform_machine == 'aarch64'"},
+  { index = "pytorch-cu128", marker = "platform_system != 'Darwin'"},
 ]
 
 [[tool.uv.index]]
-name = "pytorch-cu129"
-url = "https://download.pytorch.org/whl/cu129"
-explicit = true
-
-[[tool.uv.index]]
-name = "pytorch-cu130"
-url = "https://download.pytorch.org/whl/cu130"
+name = "pytorch-cu128"
+url = "https://download.pytorch.org/whl/cu128"
 explicit = true
 
 [[tool.uv.index]]
