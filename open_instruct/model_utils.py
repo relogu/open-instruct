@@ -429,11 +429,13 @@ async def apply_verifiable_reward(
 
 
 def get_olmo3_generation_config(tokenizer):
-    return transformers.GenerationConfig(
-        temperature=None,
-        top_p=None,
-        eos_token_id=[tokenizer.convert_tokens_to_ids("<|im_end|>"), tokenizer.convert_tokens_to_ids("<|endoftext|>")],
-    )
+    # Start with the model's existing config dict and modify only what's needed
+    config_dict = {
+        "do_sample": False,
+        "eos_token_id": [tokenizer.convert_tokens_to_ids("<|im_end|>"), tokenizer.convert_tokens_to_ids("<|endoftext|>")],
+        # Explicitly exclude temperature and top_p by not including them
+    }
+    return transformers.GenerationConfig(**config_dict)
 
 
 def save_with_accelerate(
@@ -446,21 +448,39 @@ def save_with_accelerate(
     chat_template_name: str = "tulu",
 ) -> None:
     """`model_attribute_to_save` is for used to save PPO's policy instead of the full model"""
-    # set the generation config to an empty setting to be safe.
-    # we usually do greedy decoding for generation, so this should be okay.
-    # otherwise, we get an error thrown at save time.
-    if chat_template_name and "olmo" in chat_template_name:
-        # New chat template has no bos token, and two eos tokens: <|im_end|> and <|endoftext|>
-        logger.info(f"Detected olmo chat template: {chat_template_name}, updating model generation config.")
-        model.generation_config = get_olmo3_generation_config(tokenizer)
-    else:
-        model.generation_config = transformers.GenerationConfig(
-            temperature=None, top_p=None, eos_token_id=tokenizer.eos_token_id, bos_token_id=tokenizer.bos_token_id
-        )
-
+    
     unwrapped_model: transformers.PreTrainedModel = accelerator.unwrap_model(model)
     if model_attribute_to_save is not None:
         unwrapped_model = getattr(unwrapped_model, model_attribute_to_save)
+    
+    # Set the generation config to an empty setting to be safe.
+    # We usually do greedy decoding for generation, so this should be okay.
+    # Otherwise, we get an error thrown at save time.
+    # IMPORTANT: Set this on unwrapped_model, not on the wrapped model
+    if chat_template_name and "olmo" in chat_template_name:
+        # New chat template has no bos token, and two eos tokens: <|im_end|> and <|endoftext|>
+        logger.info(f"Detected olmo chat template: {chat_template_name}, updating model generation config.")
+        # Get current config, modify it, and set it back
+        current_config = unwrapped_model.generation_config.to_dict() if unwrapped_model.generation_config else {}
+        # Remove problematic keys
+        current_config.pop("temperature", None)
+        current_config.pop("top_p", None)
+        # Set required values
+        current_config["do_sample"] = False
+        current_config["eos_token_id"] = [tokenizer.convert_tokens_to_ids("<|im_end|>"), tokenizer.convert_tokens_to_ids("<|endoftext|>")]
+        unwrapped_model.generation_config = transformers.GenerationConfig(**current_config)
+    else:
+        # Get current config, modify it, and set it back
+        current_config = unwrapped_model.generation_config.to_dict() if unwrapped_model.generation_config else {}
+        # Remove problematic keys
+        current_config.pop("temperature", None)
+        current_config.pop("top_p", None)
+        # Set required values
+        current_config["do_sample"] = False
+        current_config["eos_token_id"] = tokenizer.eos_token_id
+        current_config["bos_token_id"] = tokenizer.bos_token_id
+        unwrapped_model.generation_config = transformers.GenerationConfig(**current_config)
+    
     # When doing multi-gpu training, we need to use accelerator.get_state_dict(model) to get the state_dict.
     # Otherwise, sometimes the model will be saved with only part of the parameters.
     # Also, accelerator needs to use the wrapped model to get the state_dict.
