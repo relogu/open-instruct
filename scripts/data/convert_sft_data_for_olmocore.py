@@ -285,7 +285,15 @@ def main(args: ConvertSFTDataArguments, tc: TokenizerConfig):
 
     print(f"Total sequences: {total_instances}")
     print(f"Total tokens: {total_tokens}")
-    print(f"Maximum token ID: {max(token_ids)}")
+    max_token_id = max(token_ids) if token_ids else -1
+    min_token_id = min(token_ids) if token_ids else 0
+    print(f"Maximum token ID: {max_token_id}")
+    vocab_limit = len(tc.tokenizer)
+    if min_token_id < 0 or max_token_id >= vocab_limit:
+        raise ValueError(
+            "Token IDs out of range for tokenizer. "
+            f"min_id={min_token_id}, max_id={max_token_id}, vocab_size={vocab_limit}"
+        )
     print(f"Labels mask sum (trainable tokens): {total_trainable_tokens}")
     print("Writing data to numpy files...")
     print(f"Number of samples that should be skipped: {num_samples_skipped}")

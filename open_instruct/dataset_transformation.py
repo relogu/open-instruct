@@ -654,6 +654,43 @@ def get_tokenizer_simple_v1(tc: "TokenizerConfig"):
     return tokenizer
 
 
+def get_tokenizer_no_special_tokens_v1(tc: "TokenizerConfig"):
+    """Load tokenizer and set chat template WITHOUT adding special tokens.
+    
+    This is recommended for tokenizers that already have all needed special tokens
+    (e.g., SmolLM3, OLMo) to avoid creating out-of-vocab token IDs.
+    """
+    tokenizer = AutoTokenizer.from_pretrained(
+        tc.tokenizer_name_or_path,
+        revision=tc.tokenizer_revision,
+        trust_remote_code=tc.trust_remote_code,
+        use_fast=tc.use_fast,
+    )
+    
+    # Set the tokenizer chat template without adding special tokens
+    if tc.chat_template_name in CHAT_TEMPLATES:
+        tokenizer.chat_template = CHAT_TEMPLATES[tc.chat_template_name]
+    else:
+        try:
+            tokenizer.chat_template = AutoTokenizer.from_pretrained(
+                tc.tokenizer_name_or_path, revision=tc.tokenizer_revision
+            ).chat_template
+        except Exception:
+            raise ValueError(f"Could not find chat template for {tc.tokenizer_name_or_path}.")
+    
+    if tc.add_bos:
+        if tokenizer.chat_template.startswith("{{ bos_token }}") or (
+            tokenizer.bos_token is not None and tokenizer.chat_template.startswith(tokenizer.bos_token)
+        ):
+            raise ValueError(
+                "You specified add_bos=True, but the chat template already has a bos_token at the beginning."
+            )
+        # also add bos in the chat template if not already there
+        tokenizer.chat_template = "{{ bos_token }}" + tokenizer.chat_template
+    
+    return tokenizer
+
+
 def get_tokenizer_tulu_v1(tc: "TokenizerConfig"):
     tokenizer = AutoTokenizer.from_pretrained(
         tc.tokenizer_name_or_path,
@@ -864,6 +901,7 @@ def get_tokenizer_tulu_v2_2(tc: "TokenizerConfig"):
 
 GET_TOKENIZER_FN = {
     "get_tokenizer_simple_v1": get_tokenizer_simple_v1,
+    "get_tokenizer_no_special_tokens_v1": get_tokenizer_no_special_tokens_v1,
     "get_tokenizer_tulu_v1": get_tokenizer_tulu_v1,  # old version, see https://github.com/allenai/open-instruct/pull/570
     "get_tokenizer_tulu_v2_1": get_tokenizer_tulu_v2_1,
     "get_tokenizer_tulu_v2_2": get_tokenizer_tulu_v2_2,
