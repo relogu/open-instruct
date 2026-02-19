@@ -643,6 +643,35 @@ CHAT_TEMPLATES = {
 }
 # flake8: noqa
 
+def _add_pad_token_to_tokenizer(tokenizer: PreTrainedTokenizer) -> None:
+    if isinstance(tokenizer, transformers.PreTrainedTokenizerFast) and tokenizer.pad_token is None:
+        num_added_tokens = tokenizer.add_special_tokens({"pad_token": "<pad>"})
+        assert num_added_tokens == 1, "We detected no padding token but add_special_tokens did not add one."
+
+def _add_chat_template_to_tokenizer(tc: "TokenizerConfig", tokenizer: PreTrainedTokenizer) -> None:
+    # Set the tokenizer chat template without adding special tokens
+    if tc.chat_template_name in CHAT_TEMPLATES:
+        tokenizer.chat_template = CHAT_TEMPLATES[tc.chat_template_name]
+    else:
+        try:
+            tokenizer.chat_template = AutoTokenizer.from_pretrained(
+                tc.tokenizer_name_or_path, revision=tc.tokenizer_revision
+            ).chat_template
+        except Exception:
+            raise ValueError(f"Could not find chat template for {tc.tokenizer_name_or_path}.")
+
+
+def _add_bos_token_to_chat_template(tc: "TokenizerConfig", tokenizer: PreTrainedTokenizer) -> None:
+    if tc.add_bos:
+        if tokenizer.chat_template.startswith("{{ bos_token }}") or (
+            tokenizer.bos_token is not None and tokenizer.chat_template.startswith(tokenizer.bos_token)
+        ):
+            raise ValueError(
+                "You specified add_bos=True, but the chat template already has a bos_token at the beginning."
+            )
+        # also add bos in the chat template if not already there
+        tokenizer.chat_template = "{{ bos_token }}" + tokenizer.chat_template
+
 
 def get_tokenizer_simple_v1(tc: "TokenizerConfig"):
     tokenizer = AutoTokenizer.from_pretrained(
@@ -651,6 +680,14 @@ def get_tokenizer_simple_v1(tc: "TokenizerConfig"):
         trust_remote_code=tc.trust_remote_code,
         use_fast=tc.use_fast,
     )
+    
+    # Set the tokenizer chat template without adding special tokens
+    _add_chat_template_to_tokenizer(tc, tokenizer)
+    # Add bos token in the chat template if specified, without adding special tokens to the tokenizer
+    _add_bos_token_to_chat_template(tc, tokenizer)
+    # Add pad token if needed for tokenizers that don't have a pad token (e.g., LLaMA)
+    _add_pad_token_to_tokenizer(tokenizer)
+    
     return tokenizer
 
 
@@ -668,25 +705,9 @@ def get_tokenizer_no_special_tokens_v1(tc: "TokenizerConfig"):
     )
     
     # Set the tokenizer chat template without adding special tokens
-    if tc.chat_template_name in CHAT_TEMPLATES:
-        tokenizer.chat_template = CHAT_TEMPLATES[tc.chat_template_name]
-    else:
-        try:
-            tokenizer.chat_template = AutoTokenizer.from_pretrained(
-                tc.tokenizer_name_or_path, revision=tc.tokenizer_revision
-            ).chat_template
-        except Exception:
-            raise ValueError(f"Could not find chat template for {tc.tokenizer_name_or_path}.")
-    
-    if tc.add_bos:
-        if tokenizer.chat_template.startswith("{{ bos_token }}") or (
-            tokenizer.bos_token is not None and tokenizer.chat_template.startswith(tokenizer.bos_token)
-        ):
-            raise ValueError(
-                "You specified add_bos=True, but the chat template already has a bos_token at the beginning."
-            )
-        # also add bos in the chat template if not already there
-        tokenizer.chat_template = "{{ bos_token }}" + tokenizer.chat_template
+    _add_chat_template_to_tokenizer(tc, tokenizer)
+    # Add bos token in the chat template if specified, without adding special tokens to the tokenizer
+    _add_bos_token_to_chat_template(tc, tokenizer)
     
     return tokenizer
 
