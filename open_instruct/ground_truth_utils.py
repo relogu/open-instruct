@@ -1249,6 +1249,26 @@ async def cleanup_all_llm_judge_clients():
     await LMJudgeVerifier.cleanup_all_clients()
 
 
+def _get_verifier_timeout_seconds(reward_func: VerifierFunction) -> float:
+    """Return a bounded timeout so one verifier cannot stall the entire batch."""
+    default_timeout_s = 60.0
+    cfg = getattr(reward_func, "verifier_config", None)
+    if cfg is None:
+        return default_timeout_s
+
+    if isinstance(reward_func, LMJudgeVerifier):
+        judge_timeout_s = float(getattr(cfg, "llm_judge_timeout", default_timeout_s))
+        # Bound the timeout to keep rollout progress even if the judge backend hangs.
+        return max(30.0, min(180.0, judge_timeout_s + 15.0))
+
+    if isinstance(reward_func, CodeVerifier):
+        code_timeout_s = float(getattr(cfg, "code_max_execution_time", 1.0))
+        # HTTP timeout in CodeVerifier is at least 30s; keep this slightly above.
+        return max(35.0, min(120.0, code_timeout_s * 12.0))
+
+    return default_timeout_s
+
+
 async def apply_verifiable_reward(
     reward_fn_mapping: dict[str, VerifierFunction],
     responses: list,
@@ -1280,18 +1300,30 @@ async def apply_verifiable_reward(
                 logger.warning("No reward function found for dataset %s. Skipping reward.", ds)
                 continue
 
-            task = reward_func.async_call(
-                tokenized_prediction=tok_prediction,
-                prediction=prediction,
-                label=gt,
-                query=query,
-                rollout_state=rollout_state,
+            timeout_s = _get_verifier_timeout_seconds(reward_func)
+            task = asyncio.wait_for(
+                reward_func.async_call(
+                    tokenized_prediction=tok_prediction,
+                    prediction=prediction,
+                    label=gt,
+                    query=query,
+                    rollout_state=rollout_state,
+                ),
+                timeout=timeout_s,
             )
             async_tasks.append(task)
-            task_metadata.append({"response_idx": i, "dataset": reward_func.name, "reward_weight": reward_func.weight})
+            task_metadata.append(
+                {
+                    "response_idx": i,
+                    "dataset": reward_func.name,
+                    "reward_weight": reward_func.weight,
+                    "reward_mult": reward_mult,
+                    "timeout_s": timeout_s,
+                }
+            )
 
     if async_tasks:
-        reward_results = await asyncio.gather(*async_tasks)
+        reward_results = await asyncio.gather(*async_tasks, return_exceptions=True)
         logger.debug(f"Applied {len(reward_results)} ground truth rewards in parallel")
     else:
         reward_results = []
@@ -1303,6 +1335,23 @@ async def apply_verifiable_reward(
         response_idx = metadata["response_idx"]
         dataset = metadata["dataset"]
         reward_weight = metadata["reward_weight"]
+        reward_mult = metadata["reward_mult"]
+        timeout_s = metadata["timeout_s"]
+
+        if isinstance(result, Exception):
+            if isinstance(result, (TimeoutError, asyncio.TimeoutError)):
+                logger.warning(
+                    "Verifier '%s' timed out after %.1fs; assigning 0 reward for this sample.",
+                    dataset,
+                    timeout_s,
+                )
+            else:
+                logger.warning(
+                    "Verifier '%s' failed with %s; assigning 0 reward for this sample.",
+                    dataset,
+                    type(result).__name__,
+                )
+            continue
 
         score = result.score if hasattr(result, "score") else result
         weighted_reward = reward_mult * score * reward_weight
