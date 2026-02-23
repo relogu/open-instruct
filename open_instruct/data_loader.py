@@ -292,6 +292,7 @@ class VLLMConfig:
     vllm_num_engines: int = 1
     vllm_tensor_parallel_size: int = 1
     vllm_enforce_eager: bool = False
+    vllm_disable_custom_all_reduce: bool = False
     vllm_sync_backend: str = "nccl"
     vllm_gpu_memory_utilization: float = 0.9
     vllm_enable_prefix_caching: bool = False
@@ -329,7 +330,7 @@ class StreamingDataLoaderConfig:
     dataset_mixer_eval_list: list[str] = field(default_factory=list)
     dataset_mixer_list_splits: list[str] = field(default_factory=lambda: ["train"])
     dataset_mixer_eval_list_splits: list[str] = field(default_factory=lambda: ["test"])
-    dataset_transform_fn: list[str] = field(default_factory=lambda: ["rlvr_tokenize_v1", "rlvr_max_length_filter_v1"])
+    dataset_transform_fn: list[str] = field(default_factory=lambda: ["convert_gsm8k_messages_v1", "rlvr_tokenize_v1", "rlvr_max_length_filter_v1"])
     dataset_cache_mode: Literal["hf", "local"] = "local"
     dataset_local_cache_dir: str = "local_dataset_cache"
     dataset_config_hash: str | None = None
@@ -485,7 +486,14 @@ class StreamingDataLoader(data_loader.DataLoaderBase):
             fs_local_rank=fs_local_rank,
         )
 
-        self.data_prep_actor = ray.get_actor(data_prep_actor_name)
+        try:
+            self.data_prep_actor = ray.get_actor(data_prep_actor_name)
+        except ValueError:
+            namespace = os.environ.get("RAY_NAMESPACE", "rlvr")
+            self.data_prep_actor = ray.get_actor(
+                data_prep_actor_name,
+                namespace=namespace,
+            )
         self.tokenizer = tokenizer
         self.num_training_steps = num_training_steps
         self.training_step = 0
@@ -1037,229 +1045,247 @@ class DataPreparationActor:
         self._prep_future = self._executor.submit(self._data_preparation_loop)
 
     def _data_preparation_loop(self):
-        logger.info("[DataPreparationActor] Starting _data_preparation_loop")
+        try:
+            logger.info("[DataPreparationActor] Starting _data_preparation_loop")
 
-        if self.config.save_traces and self.config.rollouts_save_path and not self.metadata_saved:
-            save_rollout_metadata(self.config.rollouts_save_path, self.run_name, self.model_name)
-            self.metadata_saved = True
+            if self.config.save_traces and self.config.rollouts_save_path and not self.metadata_saved:
+                save_rollout_metadata(self.config.rollouts_save_path, self.run_name, self.model_name)
+                self.metadata_saved = True
 
-        num_initial_prompts = self.config.async_steps * self.global_batch_size
-        logger.info(f"[DataPreparationActor] Pushing {num_initial_prompts} initial prompts to param_prompt_Q")
-        for _ in range(num_initial_prompts):
-            add_prompt_to_generator(
-                next(self.iter_dataloader),
-                self.iter_dataloader._epoch,
-                self.param_prompt_Q,
-                self.generation_config,
-                is_eval=False,
-                base_env_config=self.base_env_config,
-            )
+            num_initial_prompts = self.config.async_steps * self.global_batch_size
+            logger.info(f"[DataPreparationActor] Pushing {num_initial_prompts} initial prompts to param_prompt_Q")
+            for _ in range(num_initial_prompts):
+                add_prompt_to_generator(
+                    next(self.iter_dataloader),
+                    self.iter_dataloader._epoch,
+                    self.param_prompt_Q,
+                    self.generation_config,
+                    is_eval=False,
+                    base_env_config=self.base_env_config,
+                )
 
-        for step in range(self.training_step, self.num_training_steps):
-            if self.shutdown_requested:
-                return
-
-            while step - self._last_consumed_step > self.config.async_steps:
+            for step in range(self.training_step, self.num_training_steps):
                 if self.shutdown_requested:
                     return
-                logger.info(
-                    f"[DataPreparationActor] Step {step}: waiting for step {self._last_consumed_step + self.config.async_steps} to be consumed. Consider increasing training compute."
-                )
-                time.sleep(0.1)
 
-            logger.info(
-                f"[DataPreparationActor] Step {step}: calling accumulate_inference_batches for {self.global_batch_size} prompts"
-            )
-            result, batch, reward_metrics, batch_stats = accumulate_inference_batches(
-                self.inference_results_Q,
-                self.generation_config,
-                num_prompts=self.global_batch_size,
-                model_dims=self.model_dims,
-                tokenizer=self.tokenizer,
-                dataset=self.dataset,
-                actor_manager=self.actor_manager,
-                active_sampling=self.config.active_sampling,
-                filter_zero_std_samples=self.config.filter_zero_std_samples,
-                replenish_prompts=True,
-                no_resampling_pass_rate=self.config.no_resampling_pass_rate,
-                iter_dataloader=self.iter_dataloader,
-                param_prompt_Q=self.param_prompt_Q,
-                training_step=step,
-                verbose=self.verbose,
-                max_possible_score=self.config.max_possible_score,
-                base_env_config=self.base_env_config,
-            )
-            logger.info(
-                f"[DataPreparationActor] Step {step}: accumulate_inference_batches returned, result type: {type(result).__name__}"
-            )
-
-            if isinstance(result, data_types.ShutdownSentinel):
-                return
-
-            if result is None:
-                empty_data = [
-                    data_types.CollatedBatchData(
-                        query_responses=[],
-                        attention_masks=[],
-                        position_ids=[],
-                        advantages=[],
-                        response_masks=[],
-                        vllm_logprobs=[],
-                    )
-                    for _ in range(self.dp_world_size)
-                ]
-                with self.lock:
-                    self.prepared_data[step] = empty_data
-                    self.metrics[step] = {}
-                    self.current_prepared_step = step
-                continue
-
-            assert batch is not None
-            assert batch_stats is not None
-            scores = np.array(batch.scores)
-            scores_per_prompt = scores.reshape(-1, self.config.num_samples_per_prompt_rollout)
-            mean_grouped_rewards = scores_per_prompt.mean(axis=-1)
-            mean_grouped_rewards = np.repeat(mean_grouped_rewards, self.config.num_samples_per_prompt_rollout, axis=0)
-            std_grouped_rewards = scores_per_prompt.std(axis=-1)
-            std_grouped_rewards = np.repeat(std_grouped_rewards, self.config.num_samples_per_prompt_rollout, axis=0)
-
-            if self.config.advantage_normalization_type == "standard":
-                advantages = (scores - mean_grouped_rewards) / (std_grouped_rewards + 1e-8)
-            elif self.config.advantage_normalization_type == "centered":
-                advantages = scores - mean_grouped_rewards
-            else:
-                raise ValueError(f"Invalid advantage normalization type: {self.config.advantage_normalization_type}")
-
-            if self.config.save_traces and self.config.rollouts_save_path:
-                save_rollouts_to_disk(
-                    self.config.rollouts_save_path,
-                    self.run_name,
-                    step,
-                    batch,
-                    result,
-                    advantages,
-                    self.config.num_samples_per_prompt_rollout,
-                    self.total_samples_written,
-                )
-                self.total_samples_written += len(batch.queries)
-
-            if self.config.mask_truncated_completions:
-                stop_idxes = torch.tensor(
-                    [i for i in range(len(result.finish_reasons)) if result.finish_reasons[i] == "stop"]
-                )
-                num_truncated = len(result.finish_reasons) - len(stop_idxes)
-                if num_truncated > 0:
+                while step - self._last_consumed_step > self.config.async_steps:
+                    if self.shutdown_requested:
+                        return
                     logger.info(
-                        f"[DataPreparationActor] Filtered {num_truncated} responses that didn't finish with 'stop'. "
-                        f"Retention rate: {len(stop_idxes) / len(result.finish_reasons):.2%}"
+                        f"[DataPreparationActor] Step {step}: waiting for step {self._last_consumed_step + self.config.async_steps} to be consumed. Consider increasing training compute."
                     )
-                scores = scores[stop_idxes]
-                advantages = advantages[stop_idxes]
-                batch = batch[stop_idxes.tolist()]
-                result.responses = [result.responses[i] for i in stop_idxes]
-                result.masks = [result.masks[i] for i in stop_idxes]
-                result.finish_reasons = [result.finish_reasons[i] for i in stop_idxes]
+                    time.sleep(0.1)
+
+                logger.info(
+                    f"[DataPreparationActor] Step {step}: calling accumulate_inference_batches for {self.global_batch_size} prompts"
+                )
+                result, batch, reward_metrics, batch_stats = accumulate_inference_batches(
+                    self.inference_results_Q,
+                    self.generation_config,
+                    num_prompts=self.global_batch_size,
+                    model_dims=self.model_dims,
+                    tokenizer=self.tokenizer,
+                    dataset=self.dataset,
+                    actor_manager=self.actor_manager,
+                    active_sampling=self.config.active_sampling,
+                    filter_zero_std_samples=self.config.filter_zero_std_samples,
+                    replenish_prompts=True,
+                    no_resampling_pass_rate=self.config.no_resampling_pass_rate,
+                    iter_dataloader=self.iter_dataloader,
+                    param_prompt_Q=self.param_prompt_Q,
+                    training_step=step,
+                    verbose=self.verbose,
+                    max_possible_score=self.config.max_possible_score,
+                    base_env_config=self.base_env_config,
+                )
+                logger.info(
+                    f"[DataPreparationActor] Step {step}: accumulate_inference_batches returned, result type: {type(result).__name__}"
+                )
+
+                if isinstance(result, data_types.ShutdownSentinel):
+                    return
+
+                if result is None:
+                    empty_data = [
+                        data_types.CollatedBatchData(
+                            query_responses=[],
+                            attention_masks=[],
+                            position_ids=[],
+                            advantages=[],
+                            response_masks=[],
+                            vllm_logprobs=[],
+                        )
+                        for _ in range(self.dp_world_size)
+                    ]
+                    with self.lock:
+                        self.prepared_data[step] = empty_data
+                        self.metrics[step] = {}
+                        self.current_prepared_step = step
+                    continue
+
+                assert batch is not None
+                assert batch_stats is not None
+                scores = np.array(batch.scores)
+                scores_per_prompt = scores.reshape(-1, self.config.num_samples_per_prompt_rollout)
+                mean_grouped_rewards = scores_per_prompt.mean(axis=-1)
+                mean_grouped_rewards = np.repeat(
+                    mean_grouped_rewards,
+                    self.config.num_samples_per_prompt_rollout,
+                    axis=0,
+                )
+                std_grouped_rewards = scores_per_prompt.std(axis=-1)
+                std_grouped_rewards = np.repeat(std_grouped_rewards, self.config.num_samples_per_prompt_rollout, axis=0)
+
+                if self.config.advantage_normalization_type == "standard":
+                    advantages = (scores - mean_grouped_rewards) / (std_grouped_rewards + 1e-8)
+                elif self.config.advantage_normalization_type == "centered":
+                    advantages = scores - mean_grouped_rewards
+                else:
+                    raise ValueError(f"Invalid advantage normalization type: {self.config.advantage_normalization_type}")
+
+                if self.config.save_traces and self.config.rollouts_save_path:
+                    save_rollouts_to_disk(
+                        self.config.rollouts_save_path,
+                        self.run_name,
+                        step,
+                        batch,
+                        result,
+                        advantages,
+                        self.config.num_samples_per_prompt_rollout,
+                        self.total_samples_written,
+                    )
+                    self.total_samples_written += len(batch.queries)
+
+                if self.config.mask_truncated_completions:
+                    stop_idxes = torch.tensor(
+                        [i for i in range(len(result.finish_reasons)) if result.finish_reasons[i] == "stop"]
+                    )
+                    num_truncated = len(result.finish_reasons) - len(stop_idxes)
+                    if num_truncated > 0:
+                        logger.info(
+                            f"[DataPreparationActor] Filtered {num_truncated} responses that didn't finish with 'stop'. "
+                            f"Retention rate: {len(stop_idxes) / len(result.finish_reasons):.2%}"
+                        )
+                    scores = scores[stop_idxes]
+                    advantages = advantages[stop_idxes]
+                    batch = batch[stop_idxes.tolist()]
+                    result.responses = [result.responses[i] for i in stop_idxes]
+                    result.masks = [result.masks[i] for i in stop_idxes]
+                    result.finish_reasons = [result.finish_reasons[i] for i in stop_idxes]
+                    assert result.logprobs is not None
+                    result.logprobs = [result.logprobs[i] for i in stop_idxes]
+
                 assert result.logprobs is not None
-                result.logprobs = [result.logprobs[i] for i in stop_idxes]
-
-            assert result.logprobs is not None
-            packed_sequences = pack_sequences(
-                queries=batch.queries,
-                responses=result.responses,
-                masks=result.masks,
-                pack_length=self.config.pack_length,
-                pad_token_id=self.tokenizer.pad_token_id,
-                vllm_logprobs=result.logprobs,
-                mask_tool_use=self.config.mask_tool_use,
-                min_num_batches=self.dp_world_size,
-            )
-            lookup_advantages = np.zeros(len(advantages) + 1, dtype=np.float32)
-            lookup_advantages[1:] = advantages
-            packed_advantages = [
-                torch.tensor(lookup_advantages[packed_mask], dtype=torch.float32)
-                for packed_mask in packed_sequences.response_masks
-            ]
-            packed_sequences.advantages = packed_advantages
-
-            collated_data = prepare_collated_data_for_workers(
-                packed_sequences, self.dp_world_size, self.per_device_train_batch_size, self.tokenizer.pad_token_id
-            )
-
-            if len(result.responses) == 0:
-                step_metrics = {}
-            else:
-                real_num_responses = len(result.responses)
-                expected_num_responses = self.config.num_samples_per_prompt_rollout * self.global_batch_size
-                unsolved_num_responses = (scores < self.config.max_possible_score).sum()
-                sequence_lengths = np.array([len(response) for response in result.responses])
-                sequence_length_solved = (
-                    np.array([])
-                    if np.all(scores == 0)
-                    else np.array(sequence_lengths[scores == self.config.max_possible_score])
+                packed_sequences = pack_sequences(
+                    queries=batch.queries,
+                    responses=result.responses,
+                    masks=result.masks,
+                    pack_length=self.config.pack_length,
+                    pad_token_id=self.tokenizer.pad_token_id,
+                    vllm_logprobs=result.logprobs,
+                    mask_tool_use=self.config.mask_tool_use,
+                    min_num_batches=self.dp_world_size,
                 )
-                sequence_length_unsolved = (
-                    np.array([])
-                    if np.all(scores == self.config.max_possible_score)
-                    else np.array(sequence_lengths[scores == 0])
+                lookup_advantages = np.zeros(len(advantages) + 1, dtype=np.float32)
+                lookup_advantages[1:] = advantages
+                packed_advantages = [
+                    torch.tensor(lookup_advantages[packed_mask], dtype=torch.float32)
+                    for packed_mask in packed_sequences.response_masks
+                ]
+                packed_sequences.advantages = packed_advantages
+
+                collated_data = prepare_collated_data_for_workers(
+                    packed_sequences,
+                    self.dp_world_size,
+                    self.per_device_train_batch_size,
+                    self.tokenizer.pad_token_id,
                 )
-                stop_rate = sum(int(fr == "stop") for fr in result.finish_reasons) / len(result.finish_reasons)
 
-                batch_metrics_dict = asdict(batch_stats)
-                batch_metrics_prefixed = {f"batch/{k}": v for k, v in batch_metrics_dict.items()}
+                if len(result.responses) == 0:
+                    step_metrics = {}
+                else:
+                    real_num_responses = len(result.responses)
+                    expected_num_responses = self.config.num_samples_per_prompt_rollout * self.global_batch_size
+                    unsolved_num_responses = (scores < self.config.max_possible_score).sum()
+                    sequence_lengths = np.array([len(response) for response in result.responses])
+                    sequence_length_solved = (
+                        np.array([])
+                        if np.all(scores == 0)
+                        else np.array(sequence_lengths[scores == self.config.max_possible_score])
+                    )
+                    sequence_length_unsolved = (
+                        np.array([])
+                        if np.all(scores == self.config.max_possible_score)
+                        else np.array(sequence_lengths[scores == 0])
+                    )
+                    stop_rate = sum(int(fr == "stop") for fr in result.finish_reasons) / len(result.finish_reasons)
 
-                step_metrics = {
-                    "scores": scores.mean(),
-                    "real_batch_size_ratio": real_num_responses / expected_num_responses,
-                    "unsolved_batch_size_ratio": unsolved_num_responses / real_num_responses,
-                    "packed_ratio": len(packed_sequences.query_responses) / real_num_responses,
-                    "val/solve_rate_hist": batch_stats.percent_solved_hist,
-                    "val/total_reward_groups": real_num_responses / self.config.num_samples_per_prompt_rollout,
-                    "val/sequence_lengths": sequence_lengths.mean(),
-                    "val/sequence_lengths_min": sequence_lengths.min(),
-                    "val/sequence_lengths_max": sequence_lengths.max(),
-                    "val/sequence_lengths_unsolved": (
-                        0 if len(sequence_length_unsolved) == 0 else sequence_length_unsolved.mean()
-                    ),
-                    "val/sequence_lengths_solved": (
-                        0 if len(sequence_length_solved) == 0 else sequence_length_solved.mean()
-                    ),
-                    "val/sequence_lengths_unsolved_hist": sequence_length_unsolved,
-                    "val/sequence_lengths_solved_hist": sequence_length_solved,
-                    "val/stop_rate": stop_rate,
-                    "val/advantages_mean": advantages.mean(),
-                    "val/advantages_min": advantages.min(),
-                    "val/advantages_max": advantages.max(),
-                    "val/advantages_hist": advantages,
-                    **reward_metrics,
-                    **batch_metrics_prefixed,
-                }
+                    batch_metrics_dict = asdict(batch_stats)
+                    batch_metrics_prefixed = {f"batch/{k}": v for k, v in batch_metrics_dict.items()}
 
-                tool_stats = EnvStatistics(tool_names=self.tool_names)
-                for rollout_stats in result.request_info.tool_call_stats:
-                    tool_stats.add_rollout(rollout_stats)
-                step_metrics.update(tool_stats.compute_metrics())
+                    step_metrics = {
+                        "scores": scores.mean(),
+                        "real_batch_size_ratio": real_num_responses / expected_num_responses,
+                        "unsolved_batch_size_ratio": unsolved_num_responses / real_num_responses,
+                        "packed_ratio": len(packed_sequences.query_responses) / real_num_responses,
+                        "val/solve_rate_hist": batch_stats.percent_solved_hist,
+                        "val/total_reward_groups": real_num_responses / self.config.num_samples_per_prompt_rollout,
+                        "val/sequence_lengths": sequence_lengths.mean(),
+                        "val/sequence_lengths_min": sequence_lengths.min(),
+                        "val/sequence_lengths_max": sequence_lengths.max(),
+                        "val/sequence_lengths_unsolved": (
+                            0 if len(sequence_length_unsolved) == 0 else sequence_length_unsolved.mean()
+                        ),
+                        "val/sequence_lengths_solved": (
+                            0 if len(sequence_length_solved) == 0 else sequence_length_solved.mean()
+                        ),
+                        "val/sequence_lengths_unsolved_hist": sequence_length_unsolved,
+                        "val/sequence_lengths_solved_hist": sequence_length_solved,
+                        "val/stop_rate": stop_rate,
+                        "val/advantages_mean": advantages.mean(),
+                        "val/advantages_min": advantages.min(),
+                        "val/advantages_max": advantages.max(),
+                        "val/advantages_hist": advantages,
+                        "val/num_calls_rate": np.array(result.request_info.num_calls).mean(),
+                        "val/timeouts_rate": np.array(result.request_info.timeouts).mean(),
+                        "val/tool_errors_rate": np.array(
+                            [len(item) > 0 for item in result.request_info.tool_errors]
+                        ).mean(),
+                        "val/tool_runtimes_rate": np.array(result.request_info.tool_runtimes).mean(),
+                        "val/tool_calleds_rate": np.array(result.request_info.tool_calleds).mean(),
+                        **reward_metrics,
+                        **batch_metrics_prefixed,
+                    }
 
-                env_metrics: dict[str, dict[str, list[float]]] = {}
-                for rs in result.request_info.rollout_states:
-                    info = rs.get("info", {})
-                    ename = info.get("env_name", "unknown")
-                    env_specific_metrics = env_metrics.setdefault(ename, {})
-                    for k, v in info.items():
-                        if k != "env_name" and isinstance(v, (int, float)):
-                            env_specific_metrics.setdefault(k, []).append(float(v))
-                for ename, metrics in env_metrics.items():
-                    for k, vals in metrics.items():
-                        step_metrics[f"env/{ename}/{k}"] = np.mean(vals)
+                    tool_stats = EnvStatistics(tool_names=self.tool_names)
+                    for rollout_stats in result.request_info.tool_call_stats:
+                        tool_stats.add_rollout(rollout_stats)
+                    step_metrics.update(tool_stats.compute_metrics())
 
-                assert result.token_statistics is not None
-                total_tokens = result.token_statistics.num_prompt_tokens + result.token_statistics.num_response_tokens
-                step_metrics["val/actor_tokens_per_second"] = total_tokens / result.token_statistics.generation_time
-                step_metrics["time/getting_response"] = result.token_statistics.generation_time
+                    env_metrics: dict[str, dict[str, list[float]]] = {}
+                    for rs in result.request_info.rollout_states:
+                        info = rs.get("info", {})
+                        ename = info.get("env_name", "unknown")
+                        env_specific_metrics = env_metrics.setdefault(ename, {})
+                        for k, v in info.items():
+                            if k != "env_name" and isinstance(v, (int, float)):
+                                env_specific_metrics.setdefault(k, []).append(float(v))
+                    for ename, metrics in env_metrics.items():
+                        for k, vals in metrics.items():
+                            step_metrics[f"env/{ename}/{k}"] = np.mean(vals)
 
-            with self.lock:
-                self.prepared_data[step] = collated_data
-                self.metrics[step] = step_metrics
-                self.current_prepared_step = step
+                    assert result.token_statistics is not None
+                    total_tokens = result.token_statistics.num_prompt_tokens + result.token_statistics.num_response_tokens
+                    step_metrics["val/actor_tokens_per_second"] = total_tokens / result.token_statistics.generation_time
+                    step_metrics["time/getting_response"] = result.token_statistics.generation_time
+
+                with self.lock:
+                    self.prepared_data[step] = collated_data
+                    self.metrics[step] = step_metrics
+                    self.current_prepared_step = step
+        except Exception:
+            logger.exception("[DataPreparationActor] Data preparation loop crashed")
+            raise
 
     def get_data(self, rank: int, step: int) -> dict:
         """Called by each rank's StreamingDataLoader. Blocks until data ready."""
