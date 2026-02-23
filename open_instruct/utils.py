@@ -51,7 +51,10 @@ from dataclasses import dataclass
 from multiprocessing import resource_tracker as _rt
 from typing import Any, NewType
 
-import beaker
+try:
+    import beaker
+except ModuleNotFoundError:
+    beaker = None
 import numpy as np
 import ray
 import requests
@@ -1041,6 +1044,10 @@ def maybe_update_beaker_description(
         original_descriptions: Cache of original descriptions for progress updates
     """
     if not is_beaker_job():
+        return
+
+    if beaker is None:
+        logger.warning("beaker package is not installed; skipping Beaker experiment description update.")
         return
 
     experiment_id = os.environ.get("BEAKER_WORKLOAD_ID")
@@ -2566,6 +2573,9 @@ def send_slack_message(message: str) -> None:
 
 def get_beaker_experiment_url() -> str | None:
     """If the env var BEAKER_WORKLOAD_ID is set, gets the current experiment URL."""
+    if beaker is None:
+        return None
+
     try:
         beaker_client = beaker.Beaker.from_env()
         workload = beaker_client.workload.get(os.environ["BEAKER_WORKLOAD_ID"])
