@@ -55,7 +55,7 @@ from typing import Any, Literal
 import numpy as np
 import torch
 import transformers
-from datasets import Dataset, concatenate_datasets, load_dataset
+from datasets import Dataset, DatasetDict, concatenate_datasets, load_dataset, load_from_disk
 from huggingface_hub import ModelCard, revision_exists
 from rich.console import Console
 from rich.text import Text
@@ -1494,7 +1494,17 @@ def rlvr_tokenize_v3(
     tool_definitions: list[dict[str, Any]] | None = None,
     pass_tools_to_chat_template: bool = True,
 ):
-    prompt = row.pop(sft_messages_key)
+    if sft_messages_key in row:
+        prompt = row.pop(sft_messages_key)
+    elif "prompt" in row:
+        prompt = [{"role": "user", "content": row["prompt"]}]
+    elif "source_prompt" in row:
+        prompt = [{"role": "user", "content": row["source_prompt"]}]
+    elif "question" in row and "answer" in row:
+        prompt = [{"role": "user", "content": row["question"]}]
+        row.setdefault(ground_truths_key, row["answer"])
+    else:
+        raise KeyError(sft_messages_key)
     assert len(prompt) > 0, "Empty prompt in dataset"
     # if the prompt has multiple messages, make sure we don't end in an assistant message.
     if len(prompt) > 1 and prompt[-1]["role"] == "assistant":
@@ -1562,6 +1572,60 @@ def rlvr_max_length_filter_v2(
     return len(row[INPUT_IDS_PROMPT_KEY]) <= max_prompt_token_length
 
 
+def convert_gsm8k_messages_v1(
+    row: Dict[str, Any],
+    tokenizer: Optional[PreTrainedTokenizer] = None,
+    ground_truths_key: str = GROUND_TRUTHS_KEY,
+    verifier_source_key: str = VERIFIER_SOURCE_KEY,
+):
+    """Convert dataset rows to messages format when possible.
+
+    Supports:
+    - Already formatted rows with a ``messages`` column.
+    - GSM8K-style rows with ``question``/``answer``.
+    - RLVR-style rows with ``prompt`` or ``source_prompt``.
+    - Rows with ``input_ids_prompt`` when a tokenizer is available.
+    """
+    if "messages" not in row:
+        if "question" in row and "answer" in row:
+            row["messages"] = [
+                {"role": "user", "content": row["question"]},
+                {"role": "assistant", "content": row["answer"]},
+            ]
+        elif "prompt" in row:
+            row["messages"] = [{"role": "user", "content": row["prompt"]}]
+        elif "source_prompt" in row:
+            row["messages"] = [{"role": "user", "content": row["source_prompt"]}]
+        elif "input_ids_prompt" in row and tokenizer is not None:
+            decoded = tokenizer.decode(row["input_ids_prompt"], skip_special_tokens=True)
+            row["messages"] = [{"role": "user", "content": decoded}]
+        else:
+            raise ValueError(
+                "Dataset row does not have any supported prompt columns. "
+                f"Found: {list(row.keys())}"
+            )
+
+    # Ensure ground_truths_key exists (use dataset column as fallback)
+    if ground_truths_key not in row:
+        if "ground_truth" in row:
+            row[ground_truths_key] = row["ground_truth"]
+        elif "answer" in row:
+            row[ground_truths_key] = (
+                row["answer"].split("####")[-1].strip()
+                if "####" in row["answer"]
+                else row["answer"]
+            )
+
+    # Ensure verifier_source_key exists
+    if verifier_source_key not in row:
+        row[verifier_source_key] = row.get(
+            "dataset",
+            row.get("dataset_source", row.get("original_dataset", "gsm8k")),
+        )
+
+    return row
+
+
 TRANSFORM_FNS = {
     "sft_tokenize_v1": (sft_tokenize_v1, "map"),
     "sft_tokenize_mask_out_prompt_v1": (sft_tokenize_mask_out_prompt_v1, "map"),
@@ -1574,6 +1638,7 @@ TRANSFORM_FNS = {
     "preference_tulu_filter_v1": (preference_tulu_filter_v1, "filter"),
     "rlvr_tokenize_v1": (rlvr_tokenize_v3, "map"),
     "rlvr_max_length_filter_v1": (rlvr_max_length_filter_v2, "filter"),
+    "convert_gsm8k_messages_v1": (convert_gsm8k_messages_v1, "map"),
 }
 
 
@@ -1650,6 +1715,21 @@ class DatasetConfig:
             dataset = load_dataset(
                 "parquet", data_files=self.dataset_name, split=self.dataset_split, num_proc=max_num_processes()
             )
+        elif os.path.isdir(self.dataset_name) and any(
+            os.path.exists(os.path.join(self.dataset_name, marker))
+            for marker in ("state.json", "dataset_info.json", "dataset_dict.json")
+        ):
+            loaded_dataset = load_from_disk(self.dataset_name, keep_in_memory=True)
+            if isinstance(loaded_dataset, DatasetDict):
+                if self.dataset_split not in loaded_dataset:
+                    available_splits = ", ".join(sorted(loaded_dataset.keys()))
+                    raise ValueError(
+                        f"Split '{self.dataset_split}' not found in local dataset '{self.dataset_name}'. "
+                        f"Available splits: {available_splits}"
+                    )
+                self.dataset = loaded_dataset[self.dataset_split]
+            else:
+                self.dataset = loaded_dataset
         else:
             # commit hash only works for hf datasets
             self.dataset_commit_hash = get_commit_hash(
@@ -1716,8 +1796,67 @@ def get_dataset_v1(dc: DatasetConfig, tc: TokenizerConfig):
     tokenizer = tc.tokenizer
     dataset = dc.dataset
 
+    def _map_with_permission_fallback(
+        ds: Dataset,
+        fn,
+        *,
+        fn_kwargs: Optional[Dict[str, Any]] = None,
+        remove_columns: Optional[List[str]] = None,
+        num_proc: Optional[int] = 1,
+        desc: Optional[str] = None,
+    ) -> Dataset:
+        try:
+            return ds.map(
+                fn,
+                fn_kwargs=fn_kwargs,
+                remove_columns=remove_columns,
+                num_proc=num_proc,
+                desc=desc,
+            )
+        except PermissionError as err:
+            if num_proc <= 1:
+                raise
+            print(
+                f"PermissionError while running dataset.map with num_proc={num_proc} ({err}). "
+                "Retrying in single-process mode (num_proc=None)."
+            )
+            return ds.map(
+                fn,
+                fn_kwargs=fn_kwargs,
+                remove_columns=remove_columns,
+                num_proc=None,
+                desc=desc,
+            )
+
+    def _filter_with_permission_fallback(
+        ds: Dataset,
+        fn,
+        *,
+        fn_kwargs: Optional[Dict[str, Any]] = None,
+        num_proc: Optional[int] = 1,
+    ) -> Dataset:
+        try:
+            return ds.filter(
+                fn,
+                fn_kwargs=fn_kwargs,
+                num_proc=num_proc,
+            )
+        except PermissionError as err:
+            if num_proc <= 1:
+                raise
+            print(
+                f"PermissionError while running dataset.filter with num_proc={num_proc} ({err}). "
+                "Retrying in single-process mode (num_proc=None)."
+            )
+            return ds.filter(
+                fn,
+                fn_kwargs=fn_kwargs,
+                num_proc=None,
+            )
+
     # Add dataset source field to track origin after shuffling
-    dataset = dataset.map(
+    dataset = _map_with_permission_fallback(
+        dataset,
         lambda example: {**example, DATASET_ORIGIN_KEY: dc.dataset_name},
         num_proc=num_proc,
         desc=f"Adding dataset source field for {dc.dataset_name}",
@@ -1746,7 +1885,8 @@ def get_dataset_v1(dc: DatasetConfig, tc: TokenizerConfig):
         target_columns = _preserve_column(ENV_CONFIG_KEY, dataset, target_columns)
 
         if fn_type == "map":
-            dataset = dataset.map(
+            dataset = _map_with_permission_fallback(
+                dataset,
                 fn,
                 fn_kwargs=fn_kwargs,
                 remove_columns=[col for col in dataset.column_names if col not in target_columns],
@@ -1754,7 +1894,8 @@ def get_dataset_v1(dc: DatasetConfig, tc: TokenizerConfig):
                 new_fingerprint=new_fingerprint,
             )
         elif fn_type == "filter":
-            dataset = dataset.filter(
+            dataset = _filter_with_permission_fallback(
+                dataset,
                 fn,
                 fn_kwargs=fn_kwargs,
                 num_proc=get_num_proc(len(dataset), num_proc, FILTER_EXAMPLE_PER_SECOND_PER_CPU),
@@ -1842,6 +1983,10 @@ class DatasetTransformationCache:
 
         # Combine datasets
         combined_dataset = concatenate_datasets(transformed_datasets)
+        # Some source datasets already include an "index" column. Rebuild it here
+        # so concatenated caches always have a single, contiguous index field.
+        if "index" in combined_dataset.column_names:
+            combined_dataset = combined_dataset.remove_columns(["index"])
         combined_dataset = combined_dataset.add_column("index", range(len(combined_dataset)))
         if dataset_skip_cache:
             return combined_dataset
@@ -1989,6 +2134,10 @@ class LocalDatasetTransformationCache:
 
         # Combine datasets
         combined_dataset = concatenate_datasets(transformed_datasets)
+        # Some source datasets already include an "index" column. Rebuild it here
+        # so concatenated caches always have a single, contiguous index field.
+        if "index" in combined_dataset.column_names:
+            combined_dataset = combined_dataset.remove_columns(["index"])
         combined_dataset = combined_dataset.add_column("index", range(len(combined_dataset)))
 
         # Prepare return statistics
