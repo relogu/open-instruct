@@ -18,6 +18,7 @@
 import argparse
 import asyncio
 import dataclasses
+import importlib
 import os
 import queue
 import socket
@@ -73,6 +74,12 @@ DRAIN_ACTIVE_TASKS_SLEEP_S = 1
 SHOULD_STOP_TIMEOUT_S = 0.1
 INFERENCE_INIT_TIMEOUT_S = 1200
 VLLM_HEALTH_CHECK_TIMEOUT_S = 600.0
+REQUEST_HEALTH_CHECK_ENABLED = os.environ.get("RLVR_VLLM_REQUEST_HEALTH_CHECK", "").strip().lower() in {
+    "1",
+    "true",
+    "yes",
+    "on",
+}
 
 
 def model_dims_from_vllm_config(vllm_config: "vllm.config.VllmConfig") -> ModelDims:
@@ -364,7 +371,168 @@ def ray_noset_visible_devices(env_vars=os.environ):
         "RAY_EXPERIMENTAL_NOSET_TPU_VISIBLE_CHIPS",
         "RAY_EXPERIMENTAL_NOSET_ONEAPI_DEVICE_SELECTOR",
     ]
-    return any(env_vars.get(env_var) for env_var in NOSET_VISIBLE_DEVICES_ENV_VARS_LIST)
+    def _is_truthy(value: object) -> bool:
+        if value is None:
+            return False
+        return str(value).strip().lower() in {"1", "true", "yes", "on"}
+
+    return any(_is_truthy(env_vars.get(env_var)) for env_var in NOSET_VISIBLE_DEVICES_ENV_VARS_LIST)
+
+
+def _patch_vllm_ray_executor_explicit_visible_devices() -> None:
+    """Force explicit rollout visibility onto vLLM Ray workers before init_device.
+
+    Ray worker wrappers are created before vLLM initializes CUDA. We patch
+    `RayDistributedExecutor._get_env_vars_to_be_updated` so worker wrapper
+    `update_environment_variables` receives the explicit rollout GPU list
+    (`RLVR_VLLM_CUDA_VISIBLE_DEVICES` / `VLLM_CUDA_VISIBLE_DEVICES`) as
+    `CUDA_VISIBLE_DEVICES`.
+    """
+    explicit = (
+        os.environ.get("RLVR_VLLM_CUDA_VISIBLE_DEVICES")
+        or os.environ.get("VLLM_CUDA_VISIBLE_DEVICES")
+        or ""
+    ).strip()
+    if not explicit:
+        return
+
+    try:
+        from vllm.platforms import current_platform as vllm_current_platform
+    except Exception:
+        return
+
+    executor_targets: list[tuple[str, type[Any]]] = []
+    seen_ids: set[int] = set()
+    for module_path in (
+        "vllm.v1.executor.ray_distributed_executor",
+        "vllm.executor.ray_distributed_executor",
+    ):
+        try:
+            module = importlib.import_module(module_path)
+            executor_cls = getattr(module, "RayDistributedExecutor", None)
+            if executor_cls is None:
+                continue
+            cls_id = id(executor_cls)
+            if cls_id in seen_ids:
+                continue
+            seen_ids.add(cls_id)
+            executor_targets.append((module_path, executor_cls))
+        except Exception:
+            continue
+
+    if not executor_targets:
+        return
+
+    device_control_env_var = getattr(vllm_current_platform, "device_control_env_var", None) or "CUDA_VISIBLE_DEVICES"
+    ray_noset_key = "RAY_EXPERIMENTAL_NOSET_CUDA_VISIBLE_DEVICES"
+    ray_override_key = "RAY_ACCEL_ENV_VAR_OVERRIDE_ON_ZERO"
+    ray_override_value = os.environ.get(ray_override_key, "0")
+
+    # Ray wraps every actor method with set/reset visible accelerator env.
+    # With NOSET enabled, that wrapper still captures then restores the pre-call
+    # CUDA_VISIBLE_DEVICES value, which can undo our explicit override.
+    # For explicit rollout visibility we bypass that wrapper entirely.
+    try:
+        import ray._private.utils as ray_private_utils
+    except Exception:
+        ray_private_utils = None
+
+    if ray_private_utils is not None and not getattr(ray_private_utils, "_rlvr_noset_visible_patch_applied", False):
+        original_set_visible_accelerator_ids = getattr(ray_private_utils, "set_visible_accelerator_ids", None)
+        if original_set_visible_accelerator_ids is not None:
+            def _patched_set_visible_accelerator_ids():
+                explicit_local = (
+                    os.environ.get("RLVR_VLLM_CUDA_VISIBLE_DEVICES")
+                    or os.environ.get("VLLM_CUDA_VISIBLE_DEVICES")
+                    or ""
+                ).strip()
+                noset_enabled = str(os.environ.get(ray_noset_key, "")).strip().lower() in {"1", "true", "yes", "on"}
+                if explicit_local and noset_enabled:
+                    return {}
+                return original_set_visible_accelerator_ids()
+
+            ray_private_utils.set_visible_accelerator_ids = _patched_set_visible_accelerator_ids
+            ray_private_utils._rlvr_noset_visible_patch_applied = True
+            logger.info("Patched Ray set_visible_accelerator_ids for explicit rollout visibility.")
+
+    for module_path, executor_cls in executor_targets:
+        if getattr(executor_cls, "_rlvr_explicit_visible_patch_applied", False):
+            continue
+
+        original_get_envs = getattr(executor_cls, "_get_env_vars_to_be_updated", None)
+        original_init_workers_ray = getattr(executor_cls, "_init_workers_ray", None)
+        if original_get_envs is None or original_init_workers_ray is None:
+            continue
+
+        def _patched_get_env_vars_to_be_updated(self, _orig=original_get_envs):
+            envs_list = _orig(self)
+            explicit_local = (
+                os.environ.get("RLVR_VLLM_CUDA_VISIBLE_DEVICES")
+                or os.environ.get("VLLM_CUDA_VISIBLE_DEVICES")
+                or ""
+            ).strip()
+            if not explicit_local:
+                return envs_list
+
+            for worker_env in envs_list:
+                if isinstance(worker_env, dict):
+                    worker_env[device_control_env_var] = explicit_local
+                    worker_env["RLVR_VLLM_CUDA_VISIBLE_DEVICES"] = explicit_local
+                    worker_env["VLLM_CUDA_VISIBLE_DEVICES"] = explicit_local
+                    worker_env["RLVR_APPLY_VLLM_RAY_VISIBLE_PATCH"] = "1"
+                    worker_env["RLVR_ENABLE_VLLM_SITECUSTOMIZE_PATCH"] = "1"
+                    # Ray can re-apply CUDA visibility at actor method boundaries.
+                    # Keep NOSET enabled inside worker actors so our explicit
+                    # visibility survives until init_device().
+                    worker_env[ray_noset_key] = "1"
+                    worker_env[ray_override_key] = ray_override_value
+
+            logger.info(
+                "Overriding vLLM Ray worker %s=%s from explicit visibility hint.",
+                device_control_env_var,
+                explicit_local,
+            )
+            return envs_list
+
+        def _patched_init_workers_ray(self, placement_group, _orig=original_init_workers_ray, **ray_remote_kwargs):
+            explicit_local = (
+                os.environ.get("RLVR_VLLM_CUDA_VISIBLE_DEVICES")
+                or os.environ.get("VLLM_CUDA_VISIBLE_DEVICES")
+                or ""
+            ).strip()
+            if explicit_local:
+                runtime_env = ray_remote_kwargs.get("runtime_env")
+                if runtime_env is None:
+                    runtime_env = {}
+                    ray_remote_kwargs["runtime_env"] = runtime_env
+                if isinstance(runtime_env, dict):
+                    runtime_env.setdefault(
+                        "worker_process_setup_hook",
+                        "flwr_model.rlvr.bootstrap.patch_open_instruct_utils",
+                    )
+                    env_vars = runtime_env.get("env_vars")
+                    if env_vars is None:
+                        env_vars = {}
+                        runtime_env["env_vars"] = env_vars
+                    if isinstance(env_vars, dict):
+                        env_vars[device_control_env_var] = explicit_local
+                        env_vars.setdefault(ray_noset_key, "1")
+                        env_vars.setdefault(ray_override_key, ray_override_value)
+                        env_vars["RLVR_VLLM_CUDA_VISIBLE_DEVICES"] = explicit_local
+                        env_vars["VLLM_CUDA_VISIBLE_DEVICES"] = explicit_local
+                        env_vars["RLVR_APPLY_VLLM_RAY_VISIBLE_PATCH"] = "1"
+                        env_vars["RLVR_ENABLE_VLLM_SITECUSTOMIZE_PATCH"] = "1"
+                        logger.info(
+                            "Injected vLLM Ray worker runtime_env hints for explicit visibility: setup_hook=%s, %s=1",
+                            "flwr_model.rlvr.bootstrap.patch_open_instruct_utils",
+                            ray_noset_key,
+                        )
+            return _orig(self, placement_group, **ray_remote_kwargs)
+
+        executor_cls._get_env_vars_to_be_updated = _patched_get_env_vars_to_be_updated
+        executor_cls._init_workers_ray = _patched_init_workers_ray
+        executor_cls._rlvr_explicit_visible_patch_applied = True
+        logger.info("Applied explicit rollout visibility patch to %s", module_path)
 
 
 # Copy from pytorch to allow creating multiple main groups.
@@ -655,11 +823,89 @@ class LLMRayActor:
             stop_sequences=self._tool_stop_sequences,
         )
 
+    @staticmethod
+    def _parse_visible_devices(raw_value: str | None) -> list[str]:
+        if raw_value is None:
+            return []
+        return [token.strip() for token in raw_value.split(",") if token.strip()]
+
+    def _maybe_pin_vllm_visible_devices(self) -> bool:
+        explicit = (
+            os.environ.get("RLVR_VLLM_CUDA_VISIBLE_DEVICES")
+            or os.environ.get("VLLM_CUDA_VISIBLE_DEVICES")
+            or ""
+        ).strip()
+        if explicit:
+            os.environ["CUDA_VISIBLE_DEVICES"] = explicit
+            logger.info(
+                "Pinned vLLM actor CUDA_VISIBLE_DEVICES=%s from explicit env",
+                explicit,
+            )
+            return True
+
+        visible = self._parse_visible_devices(os.environ.get("CUDA_VISIBLE_DEVICES"))
+        if not visible:
+            return False
+
+        num_engines_raw = os.environ.get("RLVR_VLLM_NUM_ENGINES") or ""
+        tensor_parallel_raw = os.environ.get("RLVR_VLLM_TENSOR_PARALLEL") or ""
+        trainer_gpus_raw = os.environ.get("RLVR_TRAINING_GPUS") or ""
+        try:
+            num_engines = int(num_engines_raw) if num_engines_raw else 0
+            tensor_parallel = int(tensor_parallel_raw) if tensor_parallel_raw else 0
+            trainer_gpus = int(trainer_gpus_raw) if trainer_gpus_raw else 0
+        except ValueError:
+            return False
+
+        # Auto-pin only for the common single-engine TP run to avoid overlap
+        # with trainer GPUs when Ray NOSET is enabled.
+        if num_engines != 1 or tensor_parallel <= 1 or trainer_gpus <= 0:
+            return False
+
+        start = trainer_gpus
+        end = start + tensor_parallel
+        if end > len(visible):
+            return False
+
+        pinned = ",".join(visible[start:end])
+        os.environ["CUDA_VISIBLE_DEVICES"] = pinned
+        logger.info(
+            "Auto-pinned vLLM actor CUDA_VISIBLE_DEVICES=%s (trainer_gpus=%d, tp=%d)",
+            pinned,
+            trainer_gpus,
+            tensor_parallel,
+        )
+        return True
+
     def _setup_gpu_visibility(self, noset_visible_devices: bool, distributed_executor_backend: str) -> None:
+        explicit = (
+            os.environ.get("RLVR_VLLM_CUDA_VISIBLE_DEVICES")
+            or os.environ.get("VLLM_CUDA_VISIBLE_DEVICES")
+            or ""
+        ).strip()
+        if distributed_executor_backend == "ray" and noset_visible_devices and explicit:
+            # Leave CUDA_VISIBLE_DEVICES untouched at actor start for Ray workers.
+            # We pin per-worker later (in Worker.init_device), which avoids Ray's
+            # accelerator-id remap mismatch when explicit ids are non-zero.
+            logger.info(
+                "Using explicit vLLM visibility hint (%s) without actor-level CUDA_VISIBLE_DEVICES override "
+                "because ray+NOSET is enabled.",
+                explicit,
+            )
+            return
+
+        # Always honor explicit vLLM visibility first.
+        # This is required when rollout GPUs are intentionally separated
+        # from trainer GPUs (for example trainer=0,1 and rollout=2,3).
+        if self._maybe_pin_vllm_visible_devices():
+            return
+
         # a hack to make the script work.
-        # stop ray from manipulating *_VISIBLE_DEVICES
-        # at the top-level when the distributed_executor_backend is ray.
-        if distributed_executor_backend == "ray":
+        # stop ray from manipulating *_VISIBLE_DEVICES at the top-level when
+        # using the ray backend only if NOSET is explicitly enabled.
+        # When NOSET is disabled we keep Ray-assigned visibility so workers
+        # get a consistent, non-overlapping device mapping.
+        if distributed_executor_backend == "ray" and noset_visible_devices:
             os.environ.pop("CUDA_VISIBLE_DEVICES", None)
             os.environ.pop("ROCR_VISIBLE_DEVICES", None)
         elif noset_visible_devices:
@@ -674,6 +920,18 @@ class LLMRayActor:
             os.environ["VLLM_RAY_PER_WORKER_GPUS"] = str(num_gpus)
             os.environ["VLLM_RAY_BUNDLE_INDICES"] = ",".join(map(str, bundle_indices))
             logger.debug(f"creating LLM with bundle_indices={bundle_indices}")
+
+        explicit = (
+            os.environ.get("RLVR_VLLM_CUDA_VISIBLE_DEVICES")
+            or os.environ.get("VLLM_CUDA_VISIBLE_DEVICES")
+            or ""
+        ).strip()
+        if kwargs.get("distributed_executor_backend") == "ray" and explicit:
+            os.environ["RLVR_APPLY_VLLM_RAY_VISIBLE_PATCH"] = "1"
+            os.environ["RLVR_ENABLE_VLLM_SITECUSTOMIZE_PATCH"] = "1"
+
+        if kwargs.get("distributed_executor_backend") == "ray":
+            _patch_vllm_ray_executor_explicit_visible_devices()
 
         engine_args = vllm.AsyncEngineArgs(*args, **kwargs)
         engine_args.disable_log_stats = True
@@ -870,7 +1128,8 @@ class LLMRayActor:
 
 async def process_request(actor: LLMRayActor, sub_request_id: str, sampling_params: SamplingConfig):
     """Process a single async request with tool/environment support."""
-    await _check_health(actor.server_port)
+    base_request_id = split_request_id(sub_request_id)["base_id"]
+    request_metadata = actor.request_metadata.get(base_request_id)
 
     response_tokens: list[int] = []
     response_logprobs: list[float] = []
@@ -878,29 +1137,34 @@ async def process_request(actor: LLMRayActor, sub_request_id: str, sampling_para
     cumulative_logprob = 0.0
     rollout = RolloutState()
 
-    base_request_id = split_request_id(sub_request_id)["base_id"]
-    request_metadata = actor.request_metadata[base_request_id]
-    original_prompt = request_metadata["prompt_token_ids"]
-    active_tools = request_metadata["active_tools"]
-    env_config = request_metadata.get("env_config")
-    current_prompt = list(original_prompt)
-    max_model_len = actor.llm_engine.model_config.max_model_len
-
-    configured_tools = set(actor.pools.keys())
-    allowed_tools = configured_tools & set(active_tools) if active_tools is not None else configured_tools
-
-    max_steps = env_config.get("max_steps", actor.max_steps) if env_config else actor.max_steps
-
-    # Acquired actors: pool_key -> actor (released in finally block)
-    acquired: dict[str, Any] = {}
+    acquired: dict[str, tuple[Any, Any]] = {}
     actor_map: dict[str, Any] = {}
-
-    is_text_env = False
+    env_config: dict[str, Any] | None = None
+    env_name: str | None = None
     env_response_role = "tool"
-
+    is_text_env = False
     output = None
+    request_error: Exception | None = None
+
     try:
-        # If env_config is present, acquire from the env's pool and call reset
+        # Per-request health checks are expensive and can become a failure hotspot
+        # under high-concurrency rollout traffic. Keep them opt-in via env.
+        if REQUEST_HEALTH_CHECK_ENABLED:
+            await _check_health(actor.server_port)
+
+        if request_metadata is None:
+            raise KeyError(f"Missing request metadata for {base_request_id}")
+
+        original_prompt = request_metadata["prompt_token_ids"]
+        active_tools = request_metadata["active_tools"]
+        env_config = request_metadata.get("env_config")
+        current_prompt = list(original_prompt)
+        max_model_len = actor.llm_engine.model_config.max_model_len
+
+        configured_tools = set(actor.pools.keys())
+        allowed_tools = configured_tools & set(active_tools) if active_tools is not None else configured_tools
+        max_steps = env_config.get("max_steps", actor.max_steps) if env_config else actor.max_steps
+
         if env_config is not None:
             env_name = env_config["env_name"]
             pool = actor.pools.get(env_name)
@@ -937,11 +1201,11 @@ async def process_request(actor: LLMRayActor, sub_request_id: str, sampling_para
 
             remaining_budget = sampling_params.max_tokens - len(response_masks)
             remaining_room = max_model_len - len(current_prompt)
-            per_turn_budget = actor.per_turn_max_tokens if actor.per_turn_max_tokens is not None else remaining_budget
-            current_max_tokens = max(1, min(remaining_budget, remaining_room, per_turn_budget))
             if remaining_budget <= 0 or remaining_room <= 0:
                 break
 
+            per_turn_budget = actor.per_turn_max_tokens if actor.per_turn_max_tokens is not None else remaining_budget
+            current_max_tokens = max(1, min(remaining_budget, remaining_room, per_turn_budget))
             current_sampling_params = dataclasses.replace(sampling_params, max_tokens=current_max_tokens)
             api_response = await actor.client.completions.create(
                 model=actor.model_name,
@@ -1044,22 +1308,45 @@ async def process_request(actor: LLMRayActor, sub_request_id: str, sampling_para
                 current_prompt.extend(tokens)
                 if excess > 0:
                     break
+    except Exception as exc:  # noqa: BLE001
+        request_error = exc
+        if isinstance(exc, TimeoutError):
+            rollout.timeout = True
+        error_text = f"{type(exc).__name__}: {exc}"
+        rollout.tool_error = f"{rollout.tool_error}\n{error_text}".strip()
     finally:
-        if env_config is not None and env_name in acquired:
+        if env_config is not None and env_name is not None and env_name in acquired:
             _, env_act = acquired[env_name]
             rollout.info["env_name"] = env_name
             rollout.info.update(await env_act.get_metrics.remote())
         for pool, acq_actor in acquired.values():
             pool.release.remote(acq_actor)
+        actor.active_tasks.pop(sub_request_id, None)
+
+    if request_error is not None:
+        if isinstance(request_error, TimeoutError):
+            logger.warning(
+                "Request %s failed in process_request (%s): %s. Returning fallback completion.",
+                sub_request_id,
+                type(request_error).__name__,
+                request_error,
+            )
+        else:
+            logger.warning(
+                "Request %s failed in process_request (%s): %s. Returning fallback completion.",
+                sub_request_id,
+                type(request_error).__name__,
+                request_error,
+                exc_info=(type(request_error), request_error, request_error.__traceback__),
+            )
 
     if len(response_tokens) == 0:
         eos_token_id = actor.llm_engine.tokenizer.eos_token_id
-        response_tokens.append(eos_token_id)
-        response_masks.append(1)
-        response_logprobs.append(float("nan"))
+        response_tokens = [eos_token_id] if eos_token_id is not None else []
+        response_logprobs = [float("nan")] if response_tokens else []
+        response_masks = [1] * len(response_tokens)
 
     finish_reason = output.finish_reason if output else "stop"
-
     complete_output = CompletionOutput(
         index=split_request_id(sub_request_id)["request_index"],
         token_ids=response_tokens,
@@ -1070,14 +1357,22 @@ async def process_request(actor: LLMRayActor, sub_request_id: str, sampling_para
         rollout_state=dataclasses.asdict(rollout),
     )
 
-    actor.active_tasks.pop(sub_request_id, None)
+    metadata = actor.request_metadata.get(base_request_id)
+    if metadata is None:
+        logger.warning(
+            "Dropping completion for request %s because metadata for %s is missing (likely during shutdown).",
+            sub_request_id,
+            base_request_id,
+        )
+        return
+
     actor.completion_queue.put(
         {
             "base_request_id": base_request_id,
-            "expected_n": request_metadata["original_sampling_params"].n,
+            "expected_n": metadata["original_sampling_params"].n,
             "request_output": RequestOutput(
                 request_id=sub_request_id,
-                prompt_token_ids=request_metadata["prompt_token_ids"],
+                prompt_token_ids=metadata["prompt_token_ids"],
                 outputs=[complete_output],
             ),
             "use_tools": bool(actor.pools),
@@ -1115,6 +1410,7 @@ def create_vllm_engines(
     enable_prefix_caching: bool,
     max_model_len: int,
     vllm_gpu_memory_utilization: float = 0.9,
+    disable_custom_all_reduce: bool = False,
     single_gpu_mode: bool = False,
     pg: PlacementGroup | None = None,
     tool_parser_type: str = "legacy",
@@ -1135,17 +1431,27 @@ def create_vllm_engines(
     vllm_dtype: str = "bfloat16",
 ) -> list[ray.actor.ActorHandle]:
     vllm_engines = []
-    # Use "mp" (multiprocessing) for TP > 1 when running inside a Ray actor.
-    # Using "ray" executor causes placement group context loss in vLLM v1's
-    # subprocess-based EngineCore architecture. See: https://github.com/vllm-project/vllm/issues/30016
-    distributed_executor_backend = "uni" if tensor_parallel_size == 1 else "mp"
-    use_hybrid_engine = pg is not None
+    distributed_executor_backend = "uni" if tensor_parallel_size == 1 else "ray"
+    noset_visible = ray_noset_visible_devices()
+    explicit_vllm_visible = (
+        os.environ.get("RLVR_VLLM_CUDA_VISIBLE_DEVICES")
+        or os.environ.get("VLLM_CUDA_VISIBLE_DEVICES")
+        or ""
+    ).strip()
+    use_hybrid_engine = pg is not None and not explicit_vllm_visible
     if tensor_parallel_size != 1 and use_hybrid_engine:
         raise ValueError("tensor_parallel_size > 1 is not supported with single_gpu_mode")
-    # In single_gpu_mode, use 0.5 GPU so we can schedule 2 instances on the same GPUs.
-    # Otherwise, request tensor_parallel_size GPUs so Ray sets CUDA_VISIBLE_DEVICES
-    # correctly for the "mp" distributed executor backend.
-    num_gpus = 0.5 if use_hybrid_engine and single_gpu_mode else tensor_parallel_size
+    if pg is not None and explicit_vllm_visible:
+        logger.info(
+            "Disabling hybrid vLLM placement because explicit visibility is set "
+            "(RLVR_VLLM_CUDA_VISIBLE_DEVICES/VLLM_CUDA_VISIBLE_DEVICES=%s).",
+            explicit_vllm_visible,
+        )
+    num_gpus = int(tensor_parallel_size == 1)
+    if use_hybrid_engine and tensor_parallel_size == 1 and single_gpu_mode:
+        # every worker will use 0.5 GPU, so that we can schedule
+        # 2 instances on the same GPUs.
+        num_gpus = 0.5
 
     logger.info(f"num_gpus: {num_gpus}")
 
@@ -1155,6 +1461,22 @@ def create_vllm_engines(
         bundles = [{"GPU": tensor_parallel_size, "CPU": tensor_parallel_size} for _ in range(num_engines)]
         pg = placement_group(bundles, strategy="PACK")
         ray.get(pg.ready())
+
+    runtime_env_vars = {
+        "VLLM_ENABLE_V1_MULTIPROCESSING": "0",
+        "TORCH_CUDA_ARCH_LIST": get_cuda_arch_list(),
+        "RAY_ACCEL_ENV_VAR_OVERRIDE_ON_ZERO": "0",
+    }
+    if explicit_vllm_visible:
+        # Ensure nested vLLM Ray workers inherit the intended rollout GPU slice.
+        runtime_env_vars.update(
+            {
+                "RLVR_VLLM_CUDA_VISIBLE_DEVICES": explicit_vllm_visible,
+                "VLLM_CUDA_VISIBLE_DEVICES": explicit_vllm_visible,
+                "RLVR_APPLY_VLLM_RAY_VISIBLE_PATCH": "1",
+                "RLVR_ENABLE_VLLM_SITECUSTOMIZE_PATCH": "1",
+            }
+        )
 
     # ensure we use bundles on the same node where possible if tp>1.
     bundle_indices_list = get_bundle_indices_list(pg)
@@ -1178,11 +1500,7 @@ def create_vllm_engines(
                 num_gpus=num_gpus,
                 scheduling_strategy=scheduling_strategy,
                 runtime_env=ray.runtime_env.RuntimeEnv(
-                    env_vars={
-                        "VLLM_ENABLE_V1_MULTIPROCESSING": "0",
-                        "TORCH_CUDA_ARCH_LIST": get_cuda_arch_list(),
-                        "RAY_ACCEL_ENV_VAR_OVERRIDE_ON_ZERO": "0",
-                    }
+                    env_vars=runtime_env_vars
                 ),
             )
             .remote(
@@ -1193,6 +1511,7 @@ def create_vllm_engines(
                 worker_extension_cls="open_instruct.vllm_utils_workerwrap.WorkerWrap",
                 tensor_parallel_size=tensor_parallel_size,
                 enforce_eager=enforce_eager,
+                disable_custom_all_reduce=disable_custom_all_reduce,
                 dtype=vllm_dtype,
                 seed=seed + i,
                 distributed_executor_backend=distributed_executor_backend,
@@ -1201,7 +1520,7 @@ def create_vllm_engines(
                 gpu_memory_utilization=vllm_gpu_memory_utilization,
                 bundle_indices=bundle_indices,
                 num_gpus=0.2 if use_hybrid_engine else 1,
-                noset_visible_devices=ray_noset_visible_devices(),
+                noset_visible_devices=noset_visible,
                 prompt_queue=prompt_queue,
                 results_queue=results_queue,
                 eval_results_queue=eval_results_queue,
