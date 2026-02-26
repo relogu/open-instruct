@@ -39,6 +39,13 @@ def _apply_explicit_vllm_cuda_visible_devices() -> tuple[str | None, int]:
     explicit = _explicit_rollout_visible_devices()
     if not explicit:
         return None, 0
+    current_visible = os.environ.get("CUDA_VISIBLE_DEVICES", "").strip()
+    if (
+        current_visible
+        and current_visible != explicit
+        and not os.environ.get("RLVR_ORIGINAL_CUDA_VISIBLE_DEVICES")
+    ):
+        os.environ["RLVR_ORIGINAL_CUDA_VISIBLE_DEVICES"] = current_visible
     os.environ["CUDA_VISIBLE_DEVICES"] = explicit
     return explicit, len(_parse_visible_ids(explicit))
 
@@ -200,10 +207,91 @@ def _patch_vllm_worker_init_device() -> None:
     def _patched_init_device(self, *args, **kwargs):
         explicit, num_visible = _apply_explicit_vllm_cuda_visible_devices()
         if num_visible > 0:
-            try:
-                self.local_rank = int(self.local_rank) % num_visible
-            except Exception:
-                pass
+            mapped_index = None
+            explicit_ids = _parse_visible_ids(explicit)
+            worker_index = None
+            for attr in ("rank", "global_rank", "worker_rank", "local_rank"):
+                value = getattr(self, attr, None)
+                if isinstance(value, int):
+                    worker_index = value
+                    break
+                if isinstance(value, str) and value.isdigit():
+                    worker_index = int(value)
+                    break
+            if worker_index is None:
+                env_rank = os.environ.get("RANK")
+                if env_rank and env_rank.isdigit():
+                    worker_index = int(env_rank)
+            if worker_index is None:
+                worker_index = 0
+
+            # Primary path: derive a deterministic per-engine offset from the
+            # placement-group bundle indices assigned to this actor, then place
+            # each TP worker within that actor onto consecutive explicit GPUs.
+            # Example:
+            #   explicit_ids = [2,3,4,5]
+            #   actor A bundle_indices = [0,1] -> mapped_index 0,1 (GPU 2,3)
+            #   actor B bundle_indices = [2,3] -> mapped_index 2,3 (GPU 4,5)
+            if mapped_index is None and explicit_ids:
+                bundle_indices_raw = os.environ.get("VLLM_RAY_BUNDLE_INDICES", "")
+                bundle_indices: list[int] = []
+                if bundle_indices_raw:
+                    for token in bundle_indices_raw.split(","):
+                        token = token.strip()
+                        if token.isdigit():
+                            bundle_indices.append(int(token))
+                if bundle_indices:
+                    tp_span = len(bundle_indices)
+                    base_slot = min(bundle_indices)
+                    local_tp_rank = worker_index % tp_span
+                    mapped_index = (base_slot + local_tp_rank) % num_visible
+
+            # Prefer the original per-worker CUDA visibility captured before
+            # overriding CUDA_VISIBLE_DEVICES with the explicit rollout list.
+            # This keeps Ray's worker->GPU assignment stable.
+            if mapped_index is None:
+                original_visible = _parse_visible_ids(
+                    os.environ.get("RLVR_ORIGINAL_CUDA_VISIBLE_DEVICES")
+                )
+                if original_visible:
+                    original_physical = original_visible[worker_index % len(original_visible)]
+                    if original_physical in explicit_ids:
+                        mapped_index = explicit_ids.index(original_physical)
+                    elif not explicit_ids and 0 <= original_physical < num_visible:
+                        mapped_index = original_physical
+
+            # Fall back to Ray's accelerator ids when available.
+            if mapped_index is None:
+                try:
+                    import ray
+
+                    ctx = ray.get_runtime_context()
+                    accelerator_ids = ctx.get_accelerator_ids()
+                    gpu_ids = accelerator_ids.get("GPU") or accelerator_ids.get("gpu") or []
+                    if gpu_ids:
+                        normalized_gpu_ids: list[int] = []
+                        for gpu_id in gpu_ids:
+                            try:
+                                normalized_gpu_ids.append(int(float(gpu_id)))
+                            except Exception:
+                                pass
+                        if normalized_gpu_ids:
+                            selected_id = normalized_gpu_ids[worker_index % len(normalized_gpu_ids)]
+                            if explicit_ids and selected_id in explicit_ids:
+                                mapped_index = explicit_ids.index(selected_id)
+                            elif not explicit_ids and 0 <= selected_id < num_visible:
+                                mapped_index = selected_id
+                except Exception:
+                    pass
+
+            # Final fallback: a deterministic index from inferred worker rank.
+            if mapped_index is None:
+                mapped_index = worker_index % num_visible
+
+            if mapped_index is None:
+                mapped_index = 0
+
+            self.local_rank = mapped_index
         if explicit:
             _debug(
                 "worker.init_device "
@@ -241,12 +329,29 @@ class WorkerWrap:
         explicit_ids = self._parse_visible_ids(
             os.environ.get("RLVR_VLLM_CUDA_VISIBLE_DEVICES") or os.environ.get("VLLM_CUDA_VISIBLE_DEVICES")
         )
+        model_update_rank = getattr(self, "_model_update_rank", None)
+        if isinstance(model_update_rank, str) and model_update_rank.isdigit():
+            model_update_rank = int(model_update_rank)
+        if not isinstance(model_update_rank, int):
+            model_update_rank = None
+
+        if explicit_ids and model_update_rank is not None:
+            requested_gpu = explicit_ids[model_update_rank % len(explicit_ids)]
+
+            current_visible = self._parse_visible_ids(os.environ.get("CUDA_VISIBLE_DEVICES"))
+            if current_visible:
+                try:
+                    return current_visible.index(requested_gpu)
+                except ValueError:
+                    pass
+            if 0 <= requested_gpu < device_count:
+                return requested_gpu
+            return model_update_rank % device_count
+
         if explicit_ids and torch.distributed.is_available() and torch.distributed.is_initialized():
             try:
                 rank = int(torch.distributed.get_rank())
                 requested_gpu = explicit_ids[rank % len(explicit_ids)]
-                if 0 <= requested_gpu < device_count:
-                    return requested_gpu
 
                 current_visible = self._parse_visible_ids(os.environ.get("CUDA_VISIBLE_DEVICES"))
                 if current_visible:
@@ -254,6 +359,8 @@ class WorkerWrap:
                         return current_visible.index(requested_gpu)
                     except ValueError:
                         pass
+                if 0 <= requested_gpu < device_count:
+                    return requested_gpu
                 return rank % device_count
             except Exception:
                 pass
@@ -307,6 +414,9 @@ class WorkerWrap:
         print("init_process_group")
         assert torch.distributed.is_initialized(), "default torch process group must be initialized"
         assert group_name != "", "group name must not be empty"
+        rank = torch.distributed.get_rank() + rank_offset
+        self._model_update_rank = int(rank)
+        self._model_update_world_size = int(world_size)
         bound_cuda = self._bind_cuda_device(torch)
         print(
             "init_process_group cuda: "
@@ -315,7 +425,6 @@ class WorkerWrap:
             f"RLVR_VLLM_CUDA_VISIBLE_DEVICES={os.environ.get('RLVR_VLLM_CUDA_VISIBLE_DEVICES')}"
         )
 
-        rank = torch.distributed.get_rank() + rank_offset
         if use_ray:
             import ray.util.collective as collective
 
