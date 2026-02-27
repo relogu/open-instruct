@@ -1081,9 +1081,25 @@ def sft_filter_v1(
     return max_prompt_token_length_ok and max_token_length_ok and (contain_some_labels or not need_contain_labels)
 
 
+def _normalize_chat_messages(messages: list[Dict[str, Any]]) -> list[Dict[str, Any]]:
+    """Normalize messages for chat templates that concatenate content as strings.
+    
+    This is required to support those dataset possessing samples with missing
+    content fields, e.g., some samples in allenai/Dolci-Instruct-SFT.
+    
+    """
+    normalized: list[Dict[str, Any]] = []
+    for message in messages:
+        msg = dict(message)
+        if msg.get("content") is None:
+            msg["content"] = ""
+        normalized.append(msg)
+    return normalized
+
+
 def sft_tulu_tokenize_and_truncate_v1(row: Dict[str, Any], tokenizer: PreTrainedTokenizer, max_seq_length: int):
     """taken directly from https://github.com/allenai/open-instruct/blob/ba11286e5b9eb00d4ce5b40ef4cac1389888416a/open_instruct/finetune.py#L385"""
-    messages = row["messages"]
+    messages = _normalize_chat_messages(row["messages"])
     if len(messages) == 0:
         raise ValueError("messages field is empty.")
     input_ids = tokenizer.apply_chat_template(
@@ -1151,7 +1167,7 @@ def sft_tulu_tokenize_and_truncate_v1(row: Dict[str, Any], tokenizer: PreTrained
 
 def last_turn_tulu_tokenize_and_truncate_v1(row: Dict[str, Any], tokenizer: PreTrainedTokenizer, max_seq_length: int):
     """taken directly from https://github.com/allenai/open-instruct/blob/ba11286e5b9eb00d4ce5b40ef4cac1389888416a/open_instruct/finetune.py#L385"""
-    messages = row["messages"]
+    messages = _normalize_chat_messages(row["messages"])
     if len(messages) == 0:
         raise ValueError("messages field is empty.")
     input_ids = tokenizer.apply_chat_template(
