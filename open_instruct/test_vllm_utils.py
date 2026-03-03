@@ -255,5 +255,69 @@ class TestModelDimsFromVllmConfig(unittest.TestCase):
         self.assertEqual(vllm_dims, expected_dims)
 
 
+class TestRolloutPlacementHelpers(unittest.TestCase):
+    def test_build_rollout_pg_bundles_with_explicit_node_ips(self):
+        bundles, bundle_indices = vllm_utils._build_rollout_pg_bundles(
+            num_engines=3,
+            tensor_parallel_size=2,
+            engine_node_ips=["10.0.0.1", "10.0.0.1", "10.0.0.2"],
+        )
+        self.assertEqual(len(bundles), 6)
+        self.assertEqual(bundle_indices, [[0, 1], [2, 3], [4, 5]])
+        self.assertEqual(bundles[0]["node:10.0.0.1"], 0.01)
+        self.assertEqual(bundles[2]["node:10.0.0.1"], 0.01)
+        self.assertEqual(bundles[4]["node:10.0.0.2"], 0.01)
+
+    def test_build_rollout_pg_bundles_legacy_mode(self):
+        bundles, bundle_indices = vllm_utils._build_rollout_pg_bundles(
+            num_engines=2,
+            tensor_parallel_size=2,
+            engine_node_ips=None,
+        )
+        self.assertEqual(len(bundles), 4)
+        self.assertEqual(bundle_indices, [[0, 1], [2, 3]])
+        self.assertTrue(all("GPU" in bundle and "CPU" in bundle for bundle in bundles))
+        self.assertTrue(all(not any(key.startswith("node:") for key in bundle) for bundle in bundles))
+
+    def test_build_rollout_pg_bundles_rejects_mapping_length_mismatch(self):
+        with self.assertRaises(ValueError):
+            vllm_utils._build_rollout_pg_bundles(
+                num_engines=2,
+                tensor_parallel_size=2,
+                engine_node_ips=["10.0.0.1"],
+            )
+
+    def test_normalize_engine_node_ips_requires_mapping_when_enforced(self):
+        with self.assertRaises(ValueError):
+            vllm_utils._normalize_engine_node_ips(
+                engine_node_ips=None,
+                num_engines=2,
+                enforce=True,
+            )
+
+    def test_normalize_engine_visible_devices(self):
+        normalized = vllm_utils._normalize_engine_visible_devices(
+            engine_visible_devices=["2,3", "4,5"],
+            num_engines=2,
+            tensor_parallel_size=2,
+        )
+        self.assertEqual(normalized, ["2,3", "4,5"])
+
+    def test_normalize_engine_visible_devices_rejects_bad_lengths(self):
+        with self.assertRaises(ValueError):
+            vllm_utils._normalize_engine_visible_devices(
+                engine_visible_devices=["2,3"],
+                num_engines=2,
+                tensor_parallel_size=2,
+            )
+
+        with self.assertRaises(ValueError):
+            vllm_utils._normalize_engine_visible_devices(
+                engine_visible_devices=["2", "4,5"],
+                num_engines=2,
+                tensor_parallel_size=2,
+            )
+
+
 if __name__ == "__main__":
     unittest.main()

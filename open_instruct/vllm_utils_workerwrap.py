@@ -35,6 +35,42 @@ def _parse_visible_ids(raw_value: str | None) -> list[int]:
     return ids
 
 
+def _resolve_ray_assigned_cuda_index() -> int | None:
+    """Resolve CUDA index from Ray-assigned GPU id and current visibility."""
+    try:
+        import ray
+    except Exception:
+        return None
+
+    try:
+        accelerator_ids = ray.get_runtime_context().get_accelerator_ids()
+    except Exception:
+        return None
+
+    gpu_ids = accelerator_ids.get("GPU") or accelerator_ids.get("gpu") or []
+    if not gpu_ids:
+        return None
+
+    selected: int | None = None
+    for gpu_id in gpu_ids:
+        try:
+            selected = int(float(gpu_id))
+            break
+        except Exception:
+            continue
+    if selected is None:
+        return None
+
+    current_visible = _parse_visible_ids(os.environ.get("CUDA_VISIBLE_DEVICES"))
+    if current_visible:
+        if selected in current_visible:
+            return current_visible.index(selected)
+        if 0 <= selected < len(current_visible):
+            return selected
+        return None
+    return selected
+
+
 def _apply_explicit_vllm_cuda_visible_devices() -> tuple[str | None, int]:
     explicit = _explicit_rollout_visible_devices()
     if not explicit:
@@ -206,8 +242,8 @@ def _patch_vllm_worker_init_device() -> None:
 
     def _patched_init_device(self, *args, **kwargs):
         explicit, num_visible = _apply_explicit_vllm_cuda_visible_devices()
+        mapped_index = None
         if num_visible > 0:
-            mapped_index = None
             explicit_ids = _parse_visible_ids(explicit)
             worker_index = None
             for attr in ("rank", "global_rank", "worker_rank", "local_rank"):
@@ -290,7 +326,12 @@ def _patch_vllm_worker_init_device() -> None:
 
             if mapped_index is None:
                 mapped_index = 0
+        else:
+            # When explicit rollout visibility is not set, prefer Ray's assigned
+            # GPU id over rank-based defaults to avoid colliding with policy GPUs.
+            mapped_index = _resolve_ray_assigned_cuda_index()
 
+        if mapped_index is not None:
             self.local_rank = mapped_index
         if explicit:
             _debug(
@@ -364,6 +405,10 @@ class WorkerWrap:
                 return rank % device_count
             except Exception:
                 pass
+
+        ray_assigned_index = _resolve_ray_assigned_cuda_index()
+        if ray_assigned_index is not None and 0 <= ray_assigned_index < device_count:
+            return ray_assigned_index
 
         # Prefer distributed rank when all devices are visible to avoid
         # multiple workers binding to cuda:0 in TP setups.

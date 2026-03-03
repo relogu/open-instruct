@@ -380,21 +380,20 @@ def ray_noset_visible_devices(env_vars=os.environ):
 
 
 def _patch_vllm_ray_executor_explicit_visible_devices() -> None:
-    """Force explicit rollout visibility onto vLLM Ray workers before init_device.
+    """Patch vLLM Ray workers with stable RLVR runtime hints before init_device.
 
     Ray worker wrappers are created before vLLM initializes CUDA. We patch
     `RayDistributedExecutor._get_env_vars_to_be_updated` so worker wrapper
-    `update_environment_variables` receives the explicit rollout GPU list
-    (`RLVR_VLLM_CUDA_VISIBLE_DEVICES` / `VLLM_CUDA_VISIBLE_DEVICES`) as
-    `CUDA_VISIBLE_DEVICES`.
+    `update_environment_variables` always receives RLVR patch markers and setup
+    hook hints. When explicit rollout GPU visibility is configured
+    (`RLVR_VLLM_CUDA_VISIBLE_DEVICES` / `VLLM_CUDA_VISIBLE_DEVICES`), we also
+    pass it through as `CUDA_VISIBLE_DEVICES`.
     """
     explicit = (
         os.environ.get("RLVR_VLLM_CUDA_VISIBLE_DEVICES")
         or os.environ.get("VLLM_CUDA_VISIBLE_DEVICES")
         or ""
     ).strip()
-    if not explicit:
-        return
 
     try:
         from vllm.platforms import current_platform as vllm_current_platform
@@ -427,6 +426,7 @@ def _patch_vllm_ray_executor_explicit_visible_devices() -> None:
     ray_noset_key = "RAY_EXPERIMENTAL_NOSET_CUDA_VISIBLE_DEVICES"
     ray_override_key = "RAY_ACCEL_ENV_VAR_OVERRIDE_ON_ZERO"
     ray_override_value = os.environ.get(ray_override_key, "0")
+    ray_noset_value = os.environ.get(ray_noset_key, "1")
 
     # Ray wraps every actor method with set/reset visible accelerator env.
     # With NOSET enabled, that wrapper still captures then restores the pre-call
@@ -471,27 +471,34 @@ def _patch_vllm_ray_executor_explicit_visible_devices() -> None:
                 or os.environ.get("VLLM_CUDA_VISIBLE_DEVICES")
                 or ""
             ).strip()
-            if not explicit_local:
-                return envs_list
 
             for worker_env in envs_list:
                 if isinstance(worker_env, dict):
-                    worker_env[device_control_env_var] = explicit_local
-                    worker_env["RLVR_VLLM_CUDA_VISIBLE_DEVICES"] = explicit_local
-                    worker_env["VLLM_CUDA_VISIBLE_DEVICES"] = explicit_local
                     worker_env["RLVR_APPLY_VLLM_RAY_VISIBLE_PATCH"] = "1"
                     worker_env["RLVR_ENABLE_VLLM_SITECUSTOMIZE_PATCH"] = "1"
-                    # Ray can re-apply CUDA visibility at actor method boundaries.
-                    # Keep NOSET enabled inside worker actors so our explicit
-                    # visibility survives until init_device().
-                    worker_env[ray_noset_key] = "1"
+                    # Keep worker Ray visibility settings aligned with the actor.
+                    worker_env[ray_noset_key] = ray_noset_value
                     worker_env[ray_override_key] = ray_override_value
+                    if explicit_local:
+                        worker_env[device_control_env_var] = explicit_local
+                        worker_env["RLVR_VLLM_CUDA_VISIBLE_DEVICES"] = explicit_local
+                        worker_env["VLLM_CUDA_VISIBLE_DEVICES"] = explicit_local
+                    else:
+                        worker_env.pop(device_control_env_var, None)
+                        worker_env.pop("RLVR_VLLM_CUDA_VISIBLE_DEVICES", None)
+                        worker_env.pop("VLLM_CUDA_VISIBLE_DEVICES", None)
 
-            logger.info(
-                "Overriding vLLM Ray worker %s=%s from explicit visibility hint.",
-                device_control_env_var,
-                explicit_local,
-            )
+            if explicit_local:
+                logger.info(
+                    "Overriding vLLM Ray worker %s=%s from explicit visibility hint.",
+                    device_control_env_var,
+                    explicit_local,
+                )
+            else:
+                logger.info(
+                    "Injected RLVR vLLM Ray worker patch markers without explicit %s override.",
+                    device_control_env_var,
+                )
             return envs_list
 
         def _patched_init_workers_ray(self, placement_group, _orig=original_init_workers_ray, **ray_remote_kwargs):
@@ -500,33 +507,37 @@ def _patch_vllm_ray_executor_explicit_visible_devices() -> None:
                 or os.environ.get("VLLM_CUDA_VISIBLE_DEVICES")
                 or ""
             ).strip()
-            if explicit_local:
-                runtime_env = ray_remote_kwargs.get("runtime_env")
-                if runtime_env is None:
-                    runtime_env = {}
-                    ray_remote_kwargs["runtime_env"] = runtime_env
-                if isinstance(runtime_env, dict):
-                    runtime_env.setdefault(
-                        "worker_process_setup_hook",
-                        "flwr_model.rlvr.bootstrap.patch_open_instruct_utils",
-                    )
-                    env_vars = runtime_env.get("env_vars")
-                    if env_vars is None:
-                        env_vars = {}
-                        runtime_env["env_vars"] = env_vars
-                    if isinstance(env_vars, dict):
+            runtime_env = ray_remote_kwargs.get("runtime_env")
+            if runtime_env is None:
+                runtime_env = {}
+                ray_remote_kwargs["runtime_env"] = runtime_env
+            if isinstance(runtime_env, dict):
+                runtime_env.setdefault(
+                    "worker_process_setup_hook",
+                    "flwr_model.rlvr.bootstrap.patch_open_instruct_utils",
+                )
+                env_vars = runtime_env.get("env_vars")
+                if env_vars is None:
+                    env_vars = {}
+                    runtime_env["env_vars"] = env_vars
+                if isinstance(env_vars, dict):
+                    env_vars["RLVR_APPLY_VLLM_RAY_VISIBLE_PATCH"] = "1"
+                    env_vars["RLVR_ENABLE_VLLM_SITECUSTOMIZE_PATCH"] = "1"
+                    env_vars.setdefault(ray_noset_key, ray_noset_value)
+                    env_vars.setdefault(ray_override_key, ray_override_value)
+                    if explicit_local:
                         env_vars[device_control_env_var] = explicit_local
-                        env_vars.setdefault(ray_noset_key, "1")
-                        env_vars.setdefault(ray_override_key, ray_override_value)
                         env_vars["RLVR_VLLM_CUDA_VISIBLE_DEVICES"] = explicit_local
                         env_vars["VLLM_CUDA_VISIBLE_DEVICES"] = explicit_local
-                        env_vars["RLVR_APPLY_VLLM_RAY_VISIBLE_PATCH"] = "1"
-                        env_vars["RLVR_ENABLE_VLLM_SITECUSTOMIZE_PATCH"] = "1"
-                        logger.info(
-                            "Injected vLLM Ray worker runtime_env hints for explicit visibility: setup_hook=%s, %s=1",
-                            "flwr_model.rlvr.bootstrap.patch_open_instruct_utils",
-                            ray_noset_key,
-                        )
+                    else:
+                        env_vars.pop(device_control_env_var, None)
+                        env_vars.pop("RLVR_VLLM_CUDA_VISIBLE_DEVICES", None)
+                        env_vars.pop("VLLM_CUDA_VISIBLE_DEVICES", None)
+                    logger.info(
+                        "Injected vLLM Ray worker runtime_env hints: setup_hook=%s, explicit_visibility=%s",
+                        "flwr_model.rlvr.bootstrap.patch_open_instruct_utils",
+                        bool(explicit_local),
+                    )
             return _orig(self, placement_group, **ray_remote_kwargs)
 
         executor_cls._get_env_vars_to_be_updated = _patched_get_env_vars_to_be_updated
@@ -745,6 +756,8 @@ class LLMRayActor:
         assert_threaded_actor(self)
         self._tool_definitions = tool_definitions
         self._tool_stop_sequences = tool_stop_sequences
+        self.engine_index = int(kwargs.pop("engine_index", -1))
+        self.bundle_indices = list(bundle_indices or [])
         self._init_config(
             max_steps,
             per_turn_max_tokens,
@@ -1006,6 +1019,50 @@ class LLMRayActor:
 
     def get_model_dims(self):
         return model_dims_from_vllm_config(self.llm_engine.vllm_config)
+
+    def get_placement_info(self) -> dict[str, Any]:
+        """Return rollout actor placement details for startup validation."""
+        node_ip = ""
+        try:
+            node_ip = str(ray.util.get_node_ip_address())
+        except Exception:
+            logger.exception("Failed to resolve node IP for rollout actor placement info.")
+
+        node_id = ""
+        try:
+            node_id = str(ray.get_runtime_context().get_node_id())
+        except Exception:
+            logger.exception("Failed to resolve Ray node ID for rollout actor placement info.")
+
+        gpu_ids: list[str] = []
+        try:
+            gpu_ids = [str(gpu_id) for gpu_id in ray.get_gpu_ids()]
+        except Exception:
+            logger.exception("Failed to resolve Ray GPU IDs for rollout actor placement info.")
+
+        tensor_parallel_size = 0
+        try:
+            tensor_parallel_size = int(
+                self.llm_engine.vllm_config.parallel_config.tensor_parallel_size,
+            )
+        except Exception:
+            logger.exception(
+                "Failed to resolve tensor_parallel_size for rollout actor placement info.",
+            )
+
+        return {
+            "engine_index": self.engine_index,
+            "node_ip": node_ip,
+            "ray_node_id": node_id,
+            "gpu_ids": gpu_ids,
+            "bundle_indices": list(self.bundle_indices),
+            "tensor_parallel_size": tensor_parallel_size,
+            "cuda_visible_devices": os.environ.get("CUDA_VISIBLE_DEVICES", ""),
+            "rlvr_vllm_cuda_visible_devices": os.environ.get(
+                "RLVR_VLLM_CUDA_VISIBLE_DEVICES",
+                "",
+            ),
+        }
 
     def _should_stop(self) -> bool:
         if self.actor_manager is None:
@@ -1399,6 +1456,94 @@ def get_cuda_arch_list() -> str:
     return cuda_arch_list
 
 
+def _normalize_engine_node_ips(
+    engine_node_ips: list[str] | None,
+    num_engines: int,
+    *,
+    enforce: bool,
+) -> list[str] | None:
+    """Normalize and validate explicit per-engine node mapping."""
+    if engine_node_ips is None:
+        if enforce:
+            raise ValueError(
+                "enforce_engine_node_ips=True requires engine_node_ips to be provided.",
+            )
+        return None
+
+    normalized = [node_ip.strip() for node_ip in engine_node_ips]
+    if any(not node_ip for node_ip in normalized):
+        raise ValueError("engine_node_ips must not contain empty node IP values.")
+    if len(normalized) != num_engines:
+        raise ValueError(
+            "engine_node_ips length must equal num_engines. "
+            f"Got {len(normalized)} for num_engines={num_engines}.",
+        )
+    return normalized
+
+
+def _normalize_engine_visible_devices(
+    engine_visible_devices: list[str] | None,
+    num_engines: int,
+    *,
+    tensor_parallel_size: int,
+) -> list[str] | None:
+    """Normalize and validate optional per-engine explicit CUDA visibility."""
+    if engine_visible_devices is None:
+        return None
+
+    normalized: list[str] = []
+    for raw_value in engine_visible_devices:
+        visible_tokens = [token.strip() for token in raw_value.split(",") if token.strip()]
+        if len(visible_tokens) != tensor_parallel_size:
+            raise ValueError(
+                "Each engine_visible_devices entry must contain exactly "
+                f"tensor_parallel_size={tensor_parallel_size} GPU ids. "
+                f"Got '{raw_value}' ({len(visible_tokens)} ids)."
+            )
+        normalized.append(",".join(visible_tokens))
+
+    if len(normalized) != num_engines:
+        raise ValueError(
+            "engine_visible_devices length must equal num_engines. "
+            f"Got {len(normalized)} for num_engines={num_engines}.",
+        )
+    return normalized
+
+
+def _build_rollout_pg_bundles(
+    num_engines: int,
+    tensor_parallel_size: int,
+    engine_node_ips: list[str] | None = None,
+) -> tuple[list[dict[str, float]], list[list[int]]]:
+    """Build placement-group bundles and per-engine bundle index groups."""
+    if num_engines <= 0:
+        raise ValueError(f"num_engines must be > 0, got {num_engines}.")
+    if tensor_parallel_size <= 0:
+        raise ValueError(
+            "tensor_parallel_size must be > 0, "
+            f"got {tensor_parallel_size}.",
+        )
+    if engine_node_ips is not None and len(engine_node_ips) != num_engines:
+        raise ValueError(
+            "engine_node_ips length must equal num_engines. "
+            f"Got {len(engine_node_ips)} for num_engines={num_engines}.",
+        )
+
+    bundles: list[dict[str, float]] = []
+    bundle_indices_by_engine: list[list[int]] = []
+    for engine_idx in range(num_engines):
+        engine_bundle_indices: list[int] = []
+        node_ip = engine_node_ips[engine_idx] if engine_node_ips is not None else None
+        for _ in range(tensor_parallel_size):
+            bundle: dict[str, float] = {"GPU": 1.0, "CPU": 1.0}
+            if node_ip is not None:
+                bundle[f"node:{node_ip}"] = 0.01
+            bundles.append(bundle)
+            engine_bundle_indices.append(len(bundles) - 1)
+        bundle_indices_by_engine.append(engine_bundle_indices)
+    return bundles, bundle_indices_by_engine
+
+
 def create_vllm_engines(
     num_engines: int,
     tensor_parallel_size: int,
@@ -1429,6 +1574,9 @@ def create_vllm_engines(
     train_dataset=None,
     eval_dataset=None,
     vllm_dtype: str = "bfloat16",
+    engine_node_ips: list[str] | None = None,
+    engine_visible_devices: list[str] | None = None,
+    enforce_engine_node_ips: bool = False,
 ) -> list[ray.actor.ActorHandle]:
     vllm_engines = []
     distributed_executor_backend = "uni" if tensor_parallel_size == 1 else "ray"
@@ -1438,6 +1586,21 @@ def create_vllm_engines(
         or os.environ.get("VLLM_CUDA_VISIBLE_DEVICES")
         or ""
     ).strip()
+    normalized_engine_node_ips = _normalize_engine_node_ips(
+        engine_node_ips,
+        num_engines,
+        enforce=enforce_engine_node_ips,
+    )
+    normalized_engine_visible_devices = _normalize_engine_visible_devices(
+        engine_visible_devices,
+        num_engines,
+        tensor_parallel_size=tensor_parallel_size,
+    )
+    if explicit_vllm_visible and normalized_engine_visible_devices is not None:
+        raise ValueError(
+            "engine_visible_devices cannot be combined with global explicit "
+            "RLVR_VLLM_CUDA_VISIBLE_DEVICES/VLLM_CUDA_VISIBLE_DEVICES.",
+        )
     use_hybrid_engine = pg is not None and not explicit_vllm_visible
     if tensor_parallel_size != 1 and use_hybrid_engine:
         raise ValueError("tensor_parallel_size > 1 is not supported with single_gpu_mode")
@@ -1447,6 +1610,15 @@ def create_vllm_engines(
             "(RLVR_VLLM_CUDA_VISIBLE_DEVICES/VLLM_CUDA_VISIBLE_DEVICES=%s).",
             explicit_vllm_visible,
         )
+    if use_hybrid_engine and normalized_engine_node_ips is not None:
+        msg = (
+            "engine_node_ips is not supported when using hybrid vLLM placement "
+            "(single_gpu_mode)."
+        )
+        if enforce_engine_node_ips:
+            raise ValueError(msg)
+        logger.warning("%s Ignoring explicit engine_node_ips.", msg)
+        normalized_engine_node_ips = None
     num_gpus = int(tensor_parallel_size == 1)
     if use_hybrid_engine and tensor_parallel_size == 1 and single_gpu_mode:
         # every worker will use 0.5 GPU, so that we can schedule
@@ -1455,10 +1627,13 @@ def create_vllm_engines(
 
     logger.info(f"num_gpus: {num_gpus}")
 
+    explicit_bundle_indices_by_engine: list[list[int]] = []
     if not use_hybrid_engine:
-        # Create a placement group to ensure that all engines are packed.
-        # Each bundle reserves tensor_parallel_size GPUs for one engine.
-        bundles = [{"GPU": tensor_parallel_size, "CPU": tensor_parallel_size} for _ in range(num_engines)]
+        bundles, explicit_bundle_indices_by_engine = _build_rollout_pg_bundles(
+            num_engines,
+            tensor_parallel_size,
+            normalized_engine_node_ips,
+        )
         pg = placement_group(bundles, strategy="PACK")
         ray.get(pg.ready())
 
@@ -1467,6 +1642,16 @@ def create_vllm_engines(
         "TORCH_CUDA_ARCH_LIST": get_cuda_arch_list(),
         "RAY_ACCEL_ENV_VAR_OVERRIDE_ON_ZERO": "0",
     }
+    if distributed_executor_backend == "ray":
+        # Enable scoped RLVR sitecustomize patches for all rollout Ray actors.
+        # This keeps nested vLLM Ray worker accelerator-id handling stable even
+        # when explicit rollout visibility is not configured.
+        runtime_env_vars.update(
+            {
+                "RLVR_APPLY_VLLM_RAY_VISIBLE_PATCH": "1",
+                "RLVR_ENABLE_VLLM_SITECUSTOMIZE_PATCH": "1",
+            }
+        )
     if explicit_vllm_visible:
         # Ensure nested vLLM Ray workers inherit the intended rollout GPU slice.
         runtime_env_vars.update(
@@ -1478,20 +1663,62 @@ def create_vllm_engines(
             }
         )
 
-    # ensure we use bundles on the same node where possible if tp>1.
-    bundle_indices_list = get_bundle_indices_list(pg)
+    if normalized_engine_node_ips is not None and not use_hybrid_engine:
+        # Preserve engine-to-bundle order in explicit placement mode.
+        bundle_indices_by_engine = explicit_bundle_indices_by_engine
+    else:
+        # Legacy behavior: use Ray placement order to maximize node-local TP grouping.
+        bundle_indices_list = get_bundle_indices_list(pg)
+        bundle_indices_by_engine = [
+            bundle_indices_list[i * tensor_parallel_size : (i + 1) * tensor_parallel_size]
+            for i in range(num_engines)
+        ]
 
     for i in range(num_engines):
-        if use_hybrid_engine:
-            bundle_indices = bundle_indices_list[i * tensor_parallel_size : (i + 1) * tensor_parallel_size]
-        else:
-            bundle_indices = [bundle_indices_list[i]]
+        bundle_indices = bundle_indices_by_engine[i]
+        if len(bundle_indices) != tensor_parallel_size:
+            raise RuntimeError(
+                "Resolved bundle count does not match tensor parallel size for "
+                f"engine {i}: expected {tensor_parallel_size}, got {len(bundle_indices)}.",
+            )
+
+        runtime_env_vars_for_engine = dict(runtime_env_vars)
+        engine_explicit_visible = (
+            normalized_engine_visible_devices[i]
+            if normalized_engine_visible_devices is not None
+            else None
+        )
+        if engine_explicit_visible:
+            runtime_env_vars_for_engine.update(
+                {
+                    "RLVR_VLLM_CUDA_VISIBLE_DEVICES": engine_explicit_visible,
+                    "VLLM_CUDA_VISIBLE_DEVICES": engine_explicit_visible,
+                    "RLVR_APPLY_VLLM_RAY_VISIBLE_PATCH": "1",
+                    "RLVR_ENABLE_VLLM_SITECUSTOMIZE_PATCH": "1",
+                }
+            )
 
         scheduling_strategy = PlacementGroupSchedulingStrategy(
             placement_group=pg,
             placement_group_capture_child_tasks=True,
             placement_group_bundle_index=bundle_indices[0],
         )
+
+        if normalized_engine_node_ips is not None:
+            logger.info(
+                "Creating rollout engine %d on node=%s bundles=%s explicit_visible=%s",
+                i,
+                normalized_engine_node_ips[i],
+                bundle_indices,
+                engine_explicit_visible or "<auto>",
+            )
+        else:
+            logger.info(
+                "Creating rollout engine %d bundles=%s explicit_visible=%s",
+                i,
+                bundle_indices,
+                engine_explicit_visible or "<auto>",
+            )
 
         vllm_engines.append(
             ray.remote(LLMRayActor)
@@ -1500,7 +1727,7 @@ def create_vllm_engines(
                 num_gpus=num_gpus,
                 scheduling_strategy=scheduling_strategy,
                 runtime_env=ray.runtime_env.RuntimeEnv(
-                    env_vars=runtime_env_vars
+                    env_vars=runtime_env_vars_for_engine
                 ),
             )
             .remote(
@@ -1536,6 +1763,7 @@ def create_vllm_engines(
                 reward_config=reward_config,
                 train_dataset=train_dataset,
                 eval_dataset=eval_dataset,
+                engine_index=i,
             )
         )
 
