@@ -19,9 +19,11 @@ import json
 import random
 import re
 import string
+import threading
 from collections.abc import Sequence
 
 import langdetect
+from langdetect import detector_factory as langdetect_detector_factory
 from absl import logging
 
 from open_instruct.IFEvalG import instructions_util
@@ -113,6 +115,44 @@ _PHRASES = [
     "The pen is mightier than sword",
 ]
 
+_LANGDETECT_INIT_LOCK = threading.Lock()
+
+
+def _ensure_langdetect_profiles_loaded() -> None:
+    """Initialize langdetect profiles in a thread-safe way.
+
+    `langdetect.detect()` lazily initializes a module-global factory without
+    locking. Under concurrent first-use, one thread may observe a partially
+    initialized factory and fail with "Need to load profiles.".
+    """
+    factory = getattr(langdetect_detector_factory, "_factory", None)
+    if factory is not None and getattr(factory, "langlist", None):
+        return
+
+    with _LANGDETECT_INIT_LOCK:
+        factory = getattr(langdetect_detector_factory, "_factory", None)
+        if factory is not None and getattr(factory, "langlist", None):
+            return
+
+        # Repair partially initialized global factories by rebuilding from
+        # profiles, then swapping in an initialized factory atomically.
+        rebuilt_factory = langdetect_detector_factory.DetectorFactory()
+        rebuilt_factory.load_profile(langdetect_detector_factory.PROFILES_DIRECTORY)
+        langdetect_detector_factory._factory = rebuilt_factory
+
+
+def _detect_language(value: str) -> str:
+    _ensure_langdetect_profiles_loaded()
+    return langdetect.detect(value)
+
+
+try:
+    _ensure_langdetect_profiles_loaded()
+except langdetect.LangDetectException:
+    # If profile bootstrap fails at import time, keep behavior unchanged and
+    # rely on existing per-call exception handling.
+    pass
+
 
 class Instruction:
     """An instruction template."""
@@ -178,7 +218,7 @@ class ResponseLanguageChecker(Instruction):
         assert isinstance(value, str)
 
         try:
-            return langdetect.detect(value) == self._language
+            return _detect_language(value) == self._language
         except langdetect.LangDetectException as e:
             # Count as instruction is followed.
             logging.error("Unable to detect language for text %s due to %s", value, e)  # refex: disable=pytotw.037
@@ -1355,7 +1395,7 @@ class CapitalLettersEnglishChecker(Instruction):
         assert isinstance(value, str)
 
         try:
-            return value.isupper() and langdetect.detect(value) == "en"
+            return value.isupper() and _detect_language(value) == "en"
         except langdetect.LangDetectException as e:
             # Count as instruction is followed.
             logging.error("Unable to detect language for text %s due to %s", value, e)  # refex: disable=pytotw.037
@@ -1384,7 +1424,7 @@ class LowercaseLettersEnglishChecker(Instruction):
         assert isinstance(value, str)
 
         try:
-            return value.islower() and langdetect.detect(value) == "en"
+            return value.islower() and _detect_language(value) == "en"
         except langdetect.LangDetectException as e:
             # Count as instruction is followed.
             logging.error("Unable to detect language for text %s due to %s", value, e)  # refex: disable=pytotw.037
