@@ -167,7 +167,19 @@ def build_messages(user_prompt: str, system_prompt: str | None = None):
 
 
 def extract_score_from_string(score_str: str) -> float:
-    """Extract numerical score from string response."""
+    """Extract numerical score from string response.
+
+    Parameters
+    ----------
+    score_str : str
+        The string containing the score, which may be in various formats.
+
+    Returns
+    -------
+    float
+        The extracted score as a float. If parsing fails, the score defaults to 0.0.
+
+    """
     # Handle rating formats like "4/5"
     ratio_matches = re.findall(r"(\d+)\/(\d+)", score_str)
     if ratio_matches:
@@ -185,27 +197,69 @@ def extract_score_from_string(score_str: str) -> float:
         return float(matches[0])
 
     # If parsing fails, check for binary indicators
-    if any(word in score_str.lower() for word in ["yes", "correct", "good", "true", "pass"]):
+    if any(word in score_str.lower() for word in [
+        "yes", "correct", "good", "true", "pass",
+    ]):
         return 1.0
-    elif any(word in score_str.lower() for word in ["no", "incorrect", "bad", "false", "fail"]):
+    if any(word in score_str.lower() for word in [
+        "no", "incorrect", "bad", "false", "fail",
+    ]):
         return 0.0
-    else:
-        logger.warning(f"Could not parse score from: {score_str}, defaulting to 0.0")
-        return 0.0
+    logger.warning(
+        "extract_score_from_string: Could not parse score from: %r, defaulting to 0.0",
+        score_str,
+    )
+    return 0.0
 
 
 def extract_score_web_instruct(score_str: str) -> "tuple[str, float]":
-    """Extractor based on web instruct format"""
+    """Extract score based on web instruct format.
+
+    Parameters
+    ----------
+    score_str : str
+        The string containing the score, expected to include "Final Decision: Yes" or
+        "Final Decision: No".
+
+    Returns
+    -------
+    tuple[str, float]
+        A tuple containing the original string and the extracted score (1.0 for "Yes",
+        0.0 for "No"). If parsing fails, the score defaults to 0.0.
+
+    """
     if "final decision: yes" in score_str.lower():
         return score_str, 1.0
-    elif "final decision: no" in score_str.lower():
+    if "final decision: no" in score_str.lower():
         return score_str, 0.0
-    logger.warning(f"Could not parse score from: {score_str}, defaulting to 0.0")
+    logger.warning(
+        "extract_score_web_instruct: Could not parse score from: %r, defaulting to 0.0",
+        score_str,
+    )
     return score_str, 0.0
 
 
 def extract_json_score_with_fallback(score_str: str) -> "tuple[str, float]":
-    """Extractor based on json score with fallback"""
+    """Extract score on json with fallback.
+
+    Parameters
+    ----------
+    score_str : str
+        The string containing the score, which may be in various formats.
+
+    Returns
+    -------
+    tuple[str, float]
+        A tuple containing the reasoning (original string) and the extracted score. If
+        parsing fails, the score defaults to 0.0.
+
+    Raises
+    ------
+    ValueError
+        If the input string cannot be parsed as JSON and does not contain a recognizable
+        score format.
+
+    """
     try:
         # Strip markdown code blocks if present
         cleaned_str = score_str.strip()
@@ -214,8 +268,7 @@ def extract_json_score_with_fallback(score_str: str) -> "tuple[str, float]":
         elif cleaned_str.startswith("```"):
             cleaned_str = cleaned_str[3:]  # Remove ```
 
-        if cleaned_str.endswith("```"):
-            cleaned_str = cleaned_str[:-3]  # Remove trailing ```
+        cleaned_str = cleaned_str.removesuffix("```")  # Remove trailing ```
 
         # escape newlines
         cleaned_str = cleaned_str.replace("\r\n", "\n").replace("\n", "\\n")
@@ -229,20 +282,42 @@ def extract_json_score_with_fallback(score_str: str) -> "tuple[str, float]":
             reasoning = data.get("REASONING", "")
             score = float(data.get("SCORE", 0.0))
         except json.JSONDecodeError as e:
-            score_match = re.search(r'"SCORE"\s*:\s*"?([0-9]+(?:\.[0-9]+)?)"?', cleaned_str)
+            score_match = re.search(
+                r'"SCORE"\s*:\s*"?([0-9]+(?:\.[0-9]+)?)"?',
+                cleaned_str,
+            )
             if score_match:
                 score = float(score_match.group(1))
                 reasoning = cleaned_str
             else:
-                raise ValueError() from e
-        return reasoning, score
+                raise ValueError from e
     except (json.JSONDecodeError, TypeError, ValueError):
-        logger.warning(f"Could not parse score from due to invalid json: {score_str}, defaulting to 0.0")
+        logger.warning(
+            "extract_json_score_with_fallback:"
+            " Could not parse score from: %r, defaulting to 0.0",
+            score_str,
+        )
         return score_str, 0.0
+    else:
+        return reasoning, score
 
 
 def extract_score_with_fallback_max_10(score_str: str) -> "tuple[str, float]":
-    """Extractor based on score with fallback"""
+    """Extract score with fallback.
+
+    Parameters
+    ----------
+    score_str : str
+        The string containing the score, which may be in various formats.
+
+    Returns
+    -------
+    tuple[str, float]
+        A tuple containing the reasoning (original string) and the extracted score
+        normalized to a 0-1 scale (assuming the original score is out of 10). If parsing
+        fails, the score defaults to 0.0.
+
+    """
     reasoning, score = extract_json_score_with_fallback(score_str)
     return reasoning, score / 10.0
 
