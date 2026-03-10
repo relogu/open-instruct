@@ -84,6 +84,7 @@ class LMJudgeVerifierConfig(VerifierConfig):
     llm_judge_temperature: float
     llm_judge_timeout: int
     seed: int
+    llm_judge_stop_sequences: list[str] | None = None
 
 
 @dataclasses.dataclass
@@ -719,7 +720,7 @@ class LMJudgeVerifier(VerifierFunction):
             tuple: (reasoning, score) extracted from the response
         """
         reasoning = ""
-        score = 0.0
+        score = float("nan")
 
         if not completion:
             print("No completion received from the model.")
@@ -799,7 +800,7 @@ class LMJudgeVerifier(VerifierFunction):
                         safety_margin=150,
                     ):
                         logger.error("Cannot fit request within context window even after truncation.")
-                        return VerificationResult(score=0.0, cost=0.0, reasoning="Error: Context window exceeded")
+                        return VerificationResult(score=float("nan"), cost=0.0, reasoning="Error: Context window exceeded")
                 # end of Faeze's context window check
                 response = await acompletion(
                     model=self.verifier_config.llm_judge_model,
@@ -808,6 +809,7 @@ class LMJudgeVerifier(VerifierFunction):
                     max_completion_tokens=self.verifier_config.llm_judge_max_tokens,
                     seed=self.verifier_config.seed,
                     timeout=self.verifier_config.llm_judge_timeout,
+                    **({"stop": self.verifier_config.llm_judge_stop_sequences} if self.verifier_config.llm_judge_stop_sequences else {}),
                 )
                 reasoning, score = self.parse_completion(response)
                 cost = self.get_cost(response, self.verifier_config.llm_judge_model)
@@ -817,11 +819,11 @@ class LMJudgeVerifier(VerifierFunction):
             except Exception as e:
                 logger.warning(f"LLM judge attempt {attempt + 1}/{max_retries} failed: {str(e)}")
                 if attempt == max_retries - 1:
-                    logger.error(f"LLM judge failed after {max_retries} attempts. Returning default score of 0.0")
-                    return VerificationResult(score=0.0, cost=0.0, reasoning=f"Error: {str(e)}")
+                    logger.error(f"LLM judge failed after {max_retries} attempts. Returning default score of NaN")
+                    return VerificationResult(score=float("nan"), cost=0.0, reasoning=f"Error: {str(e)}")
                 else:
                     await asyncio.sleep(retry_delay * (2**attempt))  # Exponential backoff
-        return VerificationResult(score=0.0, cost=0.0, reasoning="Unknown error after all retries.")
+        return VerificationResult(score=float("nan"), cost=0.0, reasoning="Unknown error after all retries.")
 
     def __call__(
         self,
@@ -1341,19 +1343,28 @@ async def apply_verifiable_reward(
         if isinstance(result, Exception):
             if isinstance(result, (TimeoutError, asyncio.TimeoutError)):
                 logger.warning(
-                    "Verifier '%s' timed out after %.1fs; assigning 0 reward for this sample.",
+                    "Verifier '%s' timed out after %.1fs; assigning NaN reward for this sample.",
                     dataset,
                     timeout_s,
                 )
             else:
                 logger.warning(
-                    "Verifier '%s' failed with %s; assigning 0 reward for this sample.",
+                    "Verifier '%s' failed with %s; assigning NaN reward for this sample.",
                     dataset,
                     type(result).__name__,
                 )
+            response_rewards[response_idx] = float("nan")
             continue
 
         score = result.score if hasattr(result, "score") else result
+        if np.isnan(score):
+            logger.warning(
+                "Verifier '%s' returned NaN score (judge parse failure); propagating NaN reward.",
+                dataset,
+            )
+            response_rewards[response_idx] = float("nan")
+            continue
+
         weighted_reward = reward_mult * score * reward_weight
 
         response_rewards[response_idx] += weighted_reward
@@ -1431,7 +1442,9 @@ class RewardConfig:
                     raise ValueError(f"{len(verifiable_rewards)=} != {len(scores)=}")
 
                 for i in range(len(verifiable_rewards)):
-                    if not self.only_reward_good_outputs or (good_outputs[i] and self.only_reward_good_outputs):
+                    if np.isnan(verifiable_rewards[i]):
+                        scores[i] = float("nan")
+                    elif not self.only_reward_good_outputs or (good_outputs[i] and self.only_reward_good_outputs):
                         turn_rewards = list(rollout_states[i].get("rewards", []))
                         verifier_score = verifiable_rewards[i]
 

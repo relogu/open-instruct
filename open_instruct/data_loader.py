@@ -363,6 +363,7 @@ class StreamingDataLoaderConfig:
     llm_judge_max_context_length: int = 8192
     llm_judge_temperature: float = 1.0
     llm_judge_timeout: int = 60
+    llm_judge_stop_sequences: list[str] | None = None
 
     # Code verifier
     code_api_url: str = field(
@@ -720,7 +721,7 @@ def accumulate_inference_batches(
         k_raw_queries = repeat_each([raw_query], generation_config.n)
         k_active_tools = repeat_each([sample_active_tools], generation_config.n)
 
-        percent_solved = np.mean(result.reward_scores).item() / max_possible_score
+        percent_solved = np.nanmean(result.reward_scores).item() / max_possible_score
         if no_resampling_pass_rate is not None and percent_solved >= no_resampling_pass_rate:
             assert iter_dataloader is not None
             iter_dataloader.exclude_index(result.index)
@@ -729,7 +730,7 @@ def accumulate_inference_batches(
                 f"[Data Preparation Thread] Prompt solved at {percent_solved}, will be excluded from resampling, total no resampled: {total_no_resampled}"
             )
 
-        if filter_zero_std_samples and np.std(result.reward_scores) == 0:
+        if filter_zero_std_samples and np.nanstd(result.reward_scores) == 0:
             if not active_sampling:
                 num_prompts_sampled += 1
                 progress_bar.update(1)
@@ -1126,14 +1127,22 @@ class DataPreparationActor:
                 assert batch is not None
                 assert batch_stats is not None
                 scores = np.array(batch.scores)
+                nan_mask = np.isnan(scores)
+                num_nan = int(nan_mask.sum())
+                if num_nan > 0:
+                    logger.info(
+                        f"[DataPreparationActor] {num_nan}/{len(scores)} samples have NaN scores (judge parse failures). "
+                        "These will be excluded from advantage computation."
+                    )
+
                 scores_per_prompt = scores.reshape(-1, self.config.num_samples_per_prompt_rollout)
-                mean_grouped_rewards = scores_per_prompt.mean(axis=-1)
+                mean_grouped_rewards = np.nanmean(scores_per_prompt, axis=-1)
                 mean_grouped_rewards = np.repeat(
                     mean_grouped_rewards,
                     self.config.num_samples_per_prompt_rollout,
                     axis=0,
                 )
-                std_grouped_rewards = scores_per_prompt.std(axis=-1)
+                std_grouped_rewards = np.nanstd(scores_per_prompt, axis=-1)
                 std_grouped_rewards = np.repeat(std_grouped_rewards, self.config.num_samples_per_prompt_rollout, axis=0)
 
                 if self.config.advantage_normalization_type == "standard":
@@ -1142,6 +1151,11 @@ class DataPreparationActor:
                     advantages = scores - mean_grouped_rewards
                 else:
                     raise ValueError(f"Invalid advantage normalization type: {self.config.advantage_normalization_type}")
+
+                # Zero out advantages for NaN samples so they produce no gradient signal
+                if num_nan > 0:
+                    advantages[nan_mask] = 0.0
+                    scores[nan_mask] = 0.0  # Replace NaN for downstream metric computation
 
                 if self.config.save_traces and self.config.rollouts_save_path:
                     save_rollouts_to_disk(
@@ -1253,6 +1267,8 @@ class DataPreparationActor:
                         ).mean(),
                         "val/tool_runtimes_rate": np.array(result.request_info.tool_runtimes).mean(),
                         "val/tool_calleds_rate": np.array(result.request_info.tool_calleds).mean(),
+                        "objective/judge_parse_failures": num_nan,
+                        "objective/judge_parse_failure_rate": num_nan / len(scores) if len(scores) > 0 else 0.0,
                         **reward_metrics,
                         **batch_metrics_prefixed,
                     }
