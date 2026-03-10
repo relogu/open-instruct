@@ -206,10 +206,10 @@ def extract_score_from_string(score_str: str) -> float:
     ]):
         return 0.0
     logger.warning(
-        "extract_score_from_string: Could not parse score from: %r, defaulting to 0.0",
+        "extract_score_from_string: Could not parse score from: %r, defaulting to NaN",
         score_str,
     )
-    return 0.0
+    return float("nan")
 
 
 def extract_score_web_instruct(score_str: str) -> "tuple[str, float]":
@@ -233,10 +233,10 @@ def extract_score_web_instruct(score_str: str) -> "tuple[str, float]":
     if "final decision: no" in score_str.lower():
         return score_str, 0.0
     logger.warning(
-        "extract_score_web_instruct: Could not parse score from: %r, defaulting to 0.0",
+        "extract_score_web_instruct: Could not parse score from: %r, defaulting to NaN",
         score_str,
     )
-    return score_str, 0.0
+    return score_str, float("nan")
 
 
 def extract_json_score_with_fallback(score_str: str) -> "tuple[str, float]":
@@ -294,10 +294,10 @@ def extract_json_score_with_fallback(score_str: str) -> "tuple[str, float]":
     except (json.JSONDecodeError, TypeError, ValueError):
         logger.warning(
             "extract_json_score_with_fallback:"
-            " Could not parse score from: %r, defaulting to 0.0",
+            " Could not parse score from: %r, defaulting to NaN",
             score_str,
         )
-        return score_str, 0.0
+        return score_str, float("nan")
     else:
         return reasoning, score
 
