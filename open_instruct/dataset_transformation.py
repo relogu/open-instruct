@@ -1819,6 +1819,7 @@ def get_dataset_v1(dc: DatasetConfig, tc: TokenizerConfig):
         remove_columns: Optional[List[str]] = None,
         num_proc: Optional[int] = 1,
         desc: Optional[str] = None,
+        **map_kwargs: Any,
     ) -> Dataset:
         try:
             return ds.map(
@@ -1827,6 +1828,7 @@ def get_dataset_v1(dc: DatasetConfig, tc: TokenizerConfig):
                 remove_columns=remove_columns,
                 num_proc=num_proc,
                 desc=desc,
+                **map_kwargs,
             )
         except PermissionError as err:
             if num_proc <= 1:
@@ -1841,6 +1843,7 @@ def get_dataset_v1(dc: DatasetConfig, tc: TokenizerConfig):
                 remove_columns=remove_columns,
                 num_proc=None,
                 desc=desc,
+                **map_kwargs,
             )
 
     def _filter_with_permission_fallback(
@@ -1849,12 +1852,14 @@ def get_dataset_v1(dc: DatasetConfig, tc: TokenizerConfig):
         *,
         fn_kwargs: Optional[Dict[str, Any]] = None,
         num_proc: Optional[int] = 1,
+        **filter_kwargs: Any,
     ) -> Dataset:
         try:
             return ds.filter(
                 fn,
                 fn_kwargs=fn_kwargs,
                 num_proc=num_proc,
+                **filter_kwargs,
             )
         except PermissionError as err:
             if num_proc <= 1:
@@ -1867,6 +1872,7 @@ def get_dataset_v1(dc: DatasetConfig, tc: TokenizerConfig):
                 fn,
                 fn_kwargs=fn_kwargs,
                 num_proc=None,
+                **filter_kwargs,
             )
 
     # Add dataset source field to track origin after shuffling
