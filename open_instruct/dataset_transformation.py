@@ -50,7 +50,7 @@ import multiprocessing
 import os
 from dataclasses import asdict, dataclass, field
 from functools import cached_property
-from typing import Any, Literal
+from typing import Any, Dict, List, Literal, Optional
 
 import numpy as np
 import torch
