@@ -3,7 +3,7 @@
 These tests require CUDA and Ray, and will be skipped if not available.
 
 To run:
-    ./scripts/train/build_image_and_launch.sh scripts/train/debug/run_gpu_pytest.sh
+    ./scripts/train/build_image_and_launch.sh scripts/test/run_gpu_pytest.sh
 """
 
 import logging
@@ -26,9 +26,10 @@ from open_instruct.dataset_transformation import (
     RAW_PROMPT_KEY,
     VERIFIER_SOURCE_KEY,
 )
+from open_instruct.environments.tools.utils import ParsedEnvConfig
 from open_instruct.ground_truth_utils import RewardConfig
+from open_instruct.grpo_fast import create_tool_pools
 from open_instruct.test_grpo_fast import TestGrpoFastBase
-from open_instruct.tool_utils.tools import PythonCodeTool
 from open_instruct.utils import maybe_update_beaker_description
 from open_instruct.vllm_utils import SamplingConfig, create_vllm_engines
 
@@ -48,7 +49,7 @@ class TestStreamingDataLoaderGPU(TestGrpoFastBase):
         super().setUpClass()
         cls.server_process = subprocess.Popen(
             ["uv", "run", "uvicorn", "tool_server:app", "--host", "0.0.0.0", "--port", "1213"],
-            cwd="open_instruct/tool_utils",
+            cwd="open_instruct/environments/tools/servers/python_server",
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             start_new_session=True,
@@ -73,6 +74,7 @@ class TestStreamingDataLoaderGPU(TestGrpoFastBase):
             GROUND_TRUTHS_KEY: ground_truths,
             VERIFIER_SOURCE_KEY: ["test"] * len(prompts),
             RAW_PROMPT_KEY: prompts,
+            "index": list(range(len(prompts))),
         }
         return datasets.Dataset.from_dict(data)
 
@@ -137,6 +139,9 @@ class TestStreamingDataLoaderGPU(TestGrpoFastBase):
             model_dims=self.create_llama7b_model_dims(),
             verbose=True,
             work_dir="/tmp",
+            tool_names=[],
+            run_name="test_no_tools_run",
+            model_name=tokenizer_name,
         )
 
         loader = data_loader.StreamingDataLoader(
@@ -181,7 +186,14 @@ class TestStreamingDataLoaderGPU(TestGrpoFastBase):
         eval_results_Q = ray_queue.Queue(maxsize=100)
         self._ray_queues.extend([param_prompt_Q, inference_results_Q, eval_results_Q])
 
-        tools = {"</code>": PythonCodeTool(api_endpoint=self.tool_api_endpoint, start_str="<code>", end_str="</code>")}
+        pools, _ = create_tool_pools(
+            [ParsedEnvConfig(name="python", call_name="code", config={"api_endpoint": self.tool_api_endpoint})],
+            pool_size=4,
+        )
+        # Collect tool definitions from pool for the parser
+        actor = ray.get(list(pools.values())[0].acquire.remote())
+        tool_definitions = ray.get(actor.get_tool_definitions.remote())
+        list(pools.values())[0].release.remote(actor)
 
         pg = placement_group([{"GPU": 1, "CPU": 1}], strategy="PACK")
         ray.get(pg.ready())
@@ -202,8 +214,9 @@ class TestStreamingDataLoaderGPU(TestGrpoFastBase):
             prompt_queue=param_prompt_Q,
             results_queue=inference_results_Q,
             eval_results_queue=eval_results_Q,
-            tools=tools,
-            max_tool_calls=(3,),
+            pools=pools,
+            tool_definitions=tool_definitions,
+            max_steps=3,
             reward_config=RewardConfig(),
             train_dataset=train_dataset,
         )
@@ -219,7 +232,7 @@ class TestStreamingDataLoaderGPU(TestGrpoFastBase):
             mask_tool_use=True,
         )
 
-        generation_config = SamplingConfig(temperature=0.7, top_p=1.0, max_tokens=128, n=2, stop=list(tools.keys()))
+        generation_config = SamplingConfig(temperature=0.7, top_p=1.0, max_tokens=128, n=2, stop=["</code>"])
 
         _actor = data_loader.DataPreparationActor.options(name="test_with_tools").remote(
             dataset=train_dataset,
@@ -238,6 +251,9 @@ class TestStreamingDataLoaderGPU(TestGrpoFastBase):
             model_dims=self.create_llama7b_model_dims(),
             verbose=True,
             work_dir="/tmp",
+            tool_names=["code"],
+            run_name="test_with_tools_run",
+            model_name=tokenizer_name,
         )
 
         loader = data_loader.StreamingDataLoader(

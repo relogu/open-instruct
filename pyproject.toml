@@ -13,12 +13,12 @@ dependencies = [
     "debugpy>=1.8.13",
     "deepspeed>=0.18.3",
     "hf-transfer>=0.1.8",
-    "litellm>=1.72.0,<1.75.2",  # avoid needing backoff https://github.com/BerriAI/litellm/issues/13827
+    "litellm>=1.72.0,<1.75.2", # avoid needing backoff https://github.com/BerriAI/litellm/issues/13827
     "matplotlib>=3.9.3",
-    "multiprocess<0.70.18",  # avoid AttributeError in ResourceTracker.__del__
+    "multiprocess<0.70.18", # avoid AttributeError in ResourceTracker.__del__
     "nltk>=3.9.1",
     "numpy<2",
-    "ai2-olmo-core>=2.3.0",
+    "ai2-olmo-core>=2.4.0",
     "nvitop>=1.4.2",
     "packaging>=24.2",
     "peft>=0.13.2",
@@ -32,8 +32,13 @@ dependencies = [
     "wandb>=0.18.1",
     "langdetect==1.0.9",
     "immutabledict==1.2.0",
-    "flash-attn>=2.8.3; platform_system != 'Darwin'",
+    "flash-attn>=2.8.3; platform_system != 'Darwin' and platform_machine != 'aarch64'",
     "liger-kernel>=0.5.4; platform_system != 'Darwin'",
+    "fastapi>=0.100.0",
+    "uvicorn>=0.20.0",
+    "mcp>=1.9.0",
+    "openenv-core>=0.2.1",
+    "docker>=7.0.0",
 ]
 
 [build-system]
@@ -67,16 +72,24 @@ explicit = true
 
 [project.optional-dependencies]
 code = [
-    "fastapi>=0.100.0",
-    "uvicorn>=0.20.0",
     "pydantic>=2.0.0",
     "requests>=2.28.0",
+]
+dr-tulu = [
+    "dr_agent",
+    "authlib",
+    "scipy",
 ]
 
 [tool.uv]
 preview = true
 python-preference = "only-managed"
 link-mode = "hardlink"
+environments = [
+    "sys_platform == 'linux' and platform_machine == 'x86_64'",
+    "sys_platform == 'linux' and platform_machine == 'aarch64'",
+    "sys_platform == 'darwin'",
+]
 
 [dependency-groups]
 dev = [
@@ -128,13 +141,17 @@ docstring-code-format = false
 # SIM = flake8-simplify
 # UP = pyupgrade
 # B = flake8-bugbear
-select = ["F", "E", "W", "I", "SIM", "UP", "B"]
+select = ["F", "E", "W", "I", "SIM", "UP", "B", "PLC0415"]
 ignore = [
     "B905", # zip() without explicit strict= parameter
     "C408", # dict() calls (stylistic)
     "C901", # function complexity
     "E501", # Line too long (handled by line-length setting)
 ]
+
+[tool.ruff.lint.per-file-ignores]
+# This class runs in vLLM worker processes; imports are inside methods.
+"open_instruct/vllm_utils_workerwrap.py" = ["PLC0415"]
 
 [tool.ruff.lint.isort]
 known-first-party = ["open_instruct", "mason"]
@@ -143,6 +160,12 @@ case-sensitive = false
 # Disable split-on-trailing-comma to work with skip-magic-trailing-comma
 split-on-trailing-comma = false
 
+# Ignore unresolved imports because some packages (e.g. vllm) are not available on macOS
+# Ignore possibly-missing-attribute for torch.distributed which has incomplete type stubs
+[tool.ty.rules]
+unresolved-import = "ignore"
+possibly-missing-attribute = "ignore"
+
 [tool.ty.src]
 include = [
     "open_instruct/actor_manager.py",
@@ -150,15 +173,28 @@ include = [
     "open_instruct/code_utils/api.py",
     "open_instruct/context_window_checker.py",
     "open_instruct/dataset_processor.py",
+    "open_instruct/dataset_transformation.py",
     "open_instruct/data_loader.py",
     "open_instruct/data_types.py",
+    "open_instruct/dpo_config.py",
+    "open_instruct/dpo_utils.py",
+    "open_instruct/grpo_utils.py",
     "open_instruct/logger_utils.py",
     "open_instruct/mix_data.py",
     "open_instruct/mix_data_preferences.py",
+    "open_instruct/olmo_core_train_modules.py",
     "open_instruct/padding_free_collator.py",
     "open_instruct/rejection_sampling/prompt_templates.py",
-    "open_instruct/search_utils/",
-    "open_instruct/tool_utils/tools.py",
     "open_instruct/rl_utils.py",
+    "open_instruct/rubrics/metrics.py",
+    "open_instruct/rubrics/prompts.py",
+    "open_instruct/rubrics/rubric_utils.py",
+    "open_instruct/rubrics/run_utils.py",
+    "open_instruct/environments/base.py",
+    "open_instruct/environments/examples.py",
+    "open_instruct/environments/tools/generic_mcp.py",
+    "open_instruct/environments/tools/parsers.py",
+    "open_instruct/environments/tools/tools.py",
+    "open_instruct/environments/tools/utils.py",
 ]
 exclude = ["scripts/", "decontamination/", "human_eval/"]
