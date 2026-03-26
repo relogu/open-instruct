@@ -688,7 +688,7 @@ def get_tokenizer_tulu_v1(tc: "TokenizerConfig"):
     else:
         try:
             tokenizer.chat_template = AutoTokenizer.from_pretrained(
-                tc.tokenizer_name_or_path, revision=tc.tokenizer_revision
+                tc.tokenizer_name_or_path, revision=tc.tokenizer_revision, trust_remote_code=tc.trust_remote_code, fix_mistral_regex=True  # Respect local Lizzy tokenizer remote-code loading when recovering chat templates, and keep the regex surface aligned with the active tokenizer load path.
             ).chat_template
         except Exception:
             raise ValueError(f"Could not find chat template for {tc.tokenizer_name_or_path}.") from None
@@ -752,7 +752,10 @@ def get_tokenizer_tulu_v2_1(tc: "TokenizerConfig"):
     if tc.chat_template_name is None:
         try:
             tokenizer.chat_template = AutoTokenizer.from_pretrained(
-                tc.tokenizer_name_or_path, revision=tc.tokenizer_revision
+                tc.tokenizer_name_or_path,
+                revision=tc.tokenizer_revision,
+                trust_remote_code=tc.trust_remote_code,  # Respect local Lizzy tokenizer remote-code loading when recovering chat templates.
+                fix_mistral_regex=True,  # Keep chat-template recovery loads on the same repaired regex surface as the active tokenizer load path.
             ).chat_template
         except Exception:
             raise ValueError(f"Could not find chat template for {tc.tokenizer_name_or_path}.") from None
@@ -790,6 +793,7 @@ def get_tokenizer_tulu_v2_2(tc: "TokenizerConfig"):
         tc.tokenizer_name_or_path,
         revision=tc.tokenizer_revision,
         trust_remote_code=tc.trust_remote_code,
+        fix_mistral_regex=True,  # Match the checkpoint tokenizer load path so dataset-saved tokenizer artifacts use the same repaired regex surface.
         use_fast=tc.use_fast,
     )
     # no default pad token for llama!
@@ -835,7 +839,10 @@ def get_tokenizer_tulu_v2_2(tc: "TokenizerConfig"):
     else:
         try:
             tokenizer.chat_template = AutoTokenizer.from_pretrained(
-                tc.tokenizer_name_or_path, revision=tc.tokenizer_revision
+                tc.tokenizer_name_or_path,
+                revision=tc.tokenizer_revision,
+                trust_remote_code=tc.trust_remote_code,  # Respect local Lizzy tokenizer remote-code loading when recovering chat templates.
+                fix_mistral_regex=True,  # Keep chat-template recovery loads on the same repaired regex surface as the active tokenizer load path.
             ).chat_template
         except Exception:
             raise ValueError(f"Could not find chat template for {tc.tokenizer_name_or_path}.") from None
