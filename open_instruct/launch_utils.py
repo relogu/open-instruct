@@ -6,6 +6,10 @@ from transformers.utils import hub as transformers_hub
 WEKA_CLUSTERS = ["ai2/jupiter", "ai2/saturn", "ai2/titan", "ai2/neptune", "ai2/ceres", "ai2/triton", "ai2/rhea"]
 
 
+def _transformers_cache_dir() -> str | None:
+    return getattr(transformers_hub, "TRANSFORMERS_CACHE", os.environ.get("TRANSFORMERS_CACHE"))
+
+
 def custom_cached_file(model_name_or_path: str, filename: str, revision: str | None = None, repo_type: str = "model"):
     if os.path.isdir(model_name_or_path):
         resolved_file = os.path.join(model_name_or_path, filename)
@@ -14,12 +18,17 @@ def custom_cached_file(model_name_or_path: str, filename: str, revision: str | N
         else:
             return None
     else:
+        cache_dir = _transformers_cache_dir()
+        kwargs = {
+            "revision": revision,
+            "repo_type": repo_type,
+        }
+        if cache_dir is not None:
+            kwargs["cache_dir"] = cache_dir
         resolved_file = transformers_hub.try_to_load_from_cache(
             model_name_or_path,
             filename,
-            cache_dir=transformers_hub.TRANSFORMERS_CACHE,
-            revision=revision,
-            repo_type=repo_type,
+            **kwargs,
         )
         if not isinstance(resolved_file, str):
             return None
