@@ -1667,6 +1667,7 @@ class DatasetConfig:
     dataset: Dataset = field(init=False)
 
     def __post_init__(self):
+        dataset: Dataset | None = None
         # if the file exists locally, use the local file
         if os.path.exists(self.dataset_name) and self.dataset_name.endswith(".jsonl"):
             assert self.dataset_split == "train", "Only train split is supported for local jsonl files."
@@ -1690,9 +1691,9 @@ class DatasetConfig:
                         f"Split '{self.dataset_split}' not found in local dataset '{self.dataset_name}'. "
                         f"Available splits: {available_splits}"
                     )
-                self.dataset = loaded_dataset[self.dataset_split]
+                dataset = loaded_dataset[self.dataset_split]
             else:
-                self.dataset = loaded_dataset
+                dataset = loaded_dataset
         else:
             # commit hash only works for hf datasets
             self.dataset_commit_hash = get_commit_hash(
@@ -1823,13 +1824,11 @@ def get_dataset_v1(dc: DatasetConfig, tc: TokenizerConfig):
                 **filter_kwargs,
             )
 
-    # Add dataset source field to track origin after shuffling
-    dataset = _map_with_permission_fallback(
-        dataset,
-        lambda example: {**example, DATASET_ORIGIN_KEY: dc.dataset_name},
-        num_proc=num_proc,
-        desc=f"Adding dataset source field for {dc.dataset_name}",
-    )
+    # Track dataset origin after shuffling. A direct constant column write is
+    # much cheaper and more reliable than a multi-process map for this case.
+    if DATASET_ORIGIN_KEY in dataset.column_names:
+        dataset = dataset.remove_columns([DATASET_ORIGIN_KEY])
+    dataset = dataset.add_column(DATASET_ORIGIN_KEY, [dc.dataset_name] * len(dataset))
     # Subsample the dataset for faster prototyping
     if dc.debug_mode:
         print("Debug mode is ON, subsampling dataset to 1000 examples")
