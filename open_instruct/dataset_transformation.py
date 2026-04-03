@@ -1839,10 +1839,38 @@ def get_dataset_v1(dc: DatasetConfig, tc: TokenizerConfig):
         fn_kwargs = {"tokenizer": tokenizer}
         fn_kwargs.update(fn_args)
 
-        # Compute a custom fingerprint that includes DATASET_CACHE_VERSION to invalidate
-        # HuggingFace's internal .map() cache when transformation logic changes significantly
+        # Include the tokenizer surface in the fingerprint so Hugging Face's
+        # internal .map() cache cannot silently reuse outputs produced with a
+        # different tokenizer contract.
+        tokenizer_chat_template = getattr(tokenizer, "chat_template", None)
+        tokenizer_fingerprint_payload = {
+            "tokenizer_name_or_path": tc.tokenizer_name_or_path,
+            "tokenizer_revision": tc.tokenizer_revision,
+            "trust_remote_code": tc.trust_remote_code,
+            "use_fast": tc.use_fast,
+            "chat_template_name": tc.chat_template_name,
+            "add_bos": tc.add_bos,
+            "get_tokenizer_fn": tc.get_tokenizer_fn,
+            "tokenizer_files_hash": tc.tokenizer_files_hash,
+            "tokenizer_length": len(tokenizer),
+            "bos_token_id": getattr(tokenizer, "bos_token_id", None),
+            "eos_token_id": getattr(tokenizer, "eos_token_id", None),
+            "pad_token_id": getattr(tokenizer, "pad_token_id", None),
+            "chat_template_hash": hashlib.sha256(
+                (tokenizer_chat_template or "").encode("utf-8")
+            ).hexdigest(),
+        }
         new_fingerprint = hashlib.sha256(
-            f"{DATASET_CACHE_VERSION}:{fn_name}:{dataset._fingerprint}:{json.dumps(fn_args, sort_keys=True)}".encode()
+            json.dumps(
+                {
+                    "cache_version": DATASET_CACHE_VERSION,
+                    "transform_fn": fn_name,
+                    "dataset_fingerprint": dataset._fingerprint,
+                    "fn_args": fn_args,
+                    "tokenizer": tokenizer_fingerprint_payload,
+                },
+                sort_keys=True,
+            ).encode()
         ).hexdigest()[:16]
 
         # perform the transformation
