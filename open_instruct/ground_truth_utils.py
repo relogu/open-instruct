@@ -1462,9 +1462,16 @@ class RewardConfig:
                         else:
                             scores[i] = raw_score
 
-                np_verifiable_rewards = np.array(verifiable_rewards)
-                metrics["objective/verifiable_reward"] = np_verifiable_rewards.mean()
-                metrics["objective/verifiable_correct_rate"] = (np_verifiable_rewards > 0.0).mean()
+                np_verifiable_rewards = np.array(verifiable_rewards, dtype=float)
+                valid_verifiable_mask = ~np.isnan(np_verifiable_rewards)
+                metrics["objective/verifiable_nan_rate"] = float((~valid_verifiable_mask).mean())
+                if valid_verifiable_mask.any():
+                    valid_verifiable_rewards = np_verifiable_rewards[valid_verifiable_mask]
+                    metrics["objective/verifiable_reward"] = float(valid_verifiable_rewards.mean())
+                    metrics["objective/verifiable_correct_rate"] = float((valid_verifiable_rewards > 0.0).mean())
+                else:
+                    metrics["objective/verifiable_reward"] = 0.0
+                    metrics["objective/verifiable_correct_rate"] = 0.0
                 per_func_lists: dict[str, list] = defaultdict(list)
                 for reward_dict in per_func_rewards:
                     for key, value in reward_dict.items():

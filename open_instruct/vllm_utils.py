@@ -19,6 +19,7 @@ import argparse
 import asyncio
 import dataclasses
 import importlib
+import inspect
 import os
 import queue
 import socket
@@ -668,6 +669,46 @@ def _create_server_args(model_path: str, has_chat_template: bool) -> argparse.Na
     return args
 
 
+def _init_app_state_compat(
+    engine_client: "vllm.AsyncLLMEngine",
+    state: Any,
+    args: argparse.Namespace,
+) -> Awaitable[None]:
+    try:
+        param_count = len(inspect.signature(init_app_state).parameters)
+    except (TypeError, ValueError):
+        param_count = 3
+
+    if param_count >= 4:
+        return init_app_state(engine_client, engine_client.vllm_config, state, args)
+    return init_app_state(engine_client, state, args)
+
+
+def _get_kv_cache_config_from_groups_compat(
+    vllm_config: "vllm.config.VllmConfig",
+    kv_cache_groups: list[Any],
+    kv_cache_specs: dict[str, Any],
+    available_memory: int,
+) -> Any:
+    try:
+        param_count = len(inspect.signature(kv_cache_utils.get_kv_cache_config_from_groups).parameters)
+    except (TypeError, ValueError):
+        param_count = 3
+
+    if param_count >= 4:
+        return kv_cache_utils.get_kv_cache_config_from_groups(
+            vllm_config,
+            kv_cache_groups,
+            kv_cache_specs,
+            available_memory,
+        )
+    return kv_cache_utils.get_kv_cache_config_from_groups(
+        vllm_config,
+        kv_cache_groups,
+        available_memory,
+    )
+
+
 def accumulate_completions(actor: "LLMRayActor", sub_request: dict) -> futures.Future | None:
     base_request_id = sub_request["base_request_id"]
     expected_n = sub_request["expected_n"]
@@ -971,7 +1012,7 @@ class LLMRayActor:
             has_chat_template = getattr(inner_tokenizer, "chat_template", None) is not None
             args = _create_server_args(engine_client.vllm_config.model_config.model, has_chat_template)
             app = build_app(args)
-            await init_app_state(engine_client, app.state, args)
+            await _init_app_state_compat(engine_client, app.state, args)
 
             # Create a socket and bind to port 0 to let the OS assign an available port.
             # We pass the socket to serve_http to avoid race conditions where another
@@ -1222,8 +1263,11 @@ class LLMRayActor:
 
         kv_cache_groups = kv_cache_utils.get_kv_cache_groups(vllm_config, kv_cache_specs[0])
 
-        kv_cache_config = kv_cache_utils.get_kv_cache_config_from_groups(
-            vllm_config, kv_cache_groups, available_memory
+        kv_cache_config = _get_kv_cache_config_from_groups_compat(
+            vllm_config,
+            kv_cache_groups,
+            kv_cache_specs[0],
+            available_memory,
         )
 
         max_concurrency = kv_cache_utils.get_max_concurrency_for_kv_cache_config(vllm_config, kv_cache_config)

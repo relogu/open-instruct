@@ -65,6 +65,34 @@ def to_device(batch: dict[str, Any], device: torch.device | None) -> dict[str, A
     return {k: v.to(device) if isinstance(v, torch.Tensor) else v for k, v in batch.items()}
 
 
+def _restore_last_consumed_step_for_resume(initial_state: dict[str, Any] | None) -> int:
+    """Infer the last consumed rollout step for a resumed data-prep actor.
+
+    When we resume from checkpoint, the next step to prepare is stored in
+    ``training_step``. The actor's async backpressure gate, however, tracks the last
+    consumed step separately. Older checkpoints do not serialize that watermark, so we
+    conservatively infer it from ``training_step - 1``.
+    """
+    if not initial_state:
+        return -1
+
+    raw_last_consumed_step = initial_state.get("last_consumed_step")
+    if raw_last_consumed_step is not None:
+        try:
+            return max(int(raw_last_consumed_step), -1)
+        except (TypeError, ValueError):
+            logger.warning(
+                "[DataPreparationActor] Ignoring invalid last_consumed_step=%r in restored state",
+                raw_last_consumed_step,
+            )
+
+    try:
+        restored_training_step = int(initial_state.get("training_step", 0))
+    except (TypeError, ValueError):
+        restored_training_step = 0
+    return max(restored_training_step - 1, -1)
+
+
 class HFDataLoader(data_loader.DataLoaderBase):
     """A DataLoader that wraps a HuggingFace Dataset for use with olmo_core's Trainer.
 
@@ -1030,7 +1058,9 @@ class DataPreparationActor:
         self.prepared_data: dict[int, list[data_types.CollatedBatchData]] = {}
         self.metrics: dict[int, dict] = {}
         self.current_prepared_step = -1
-        self._last_consumed_step = -1
+        self._last_consumed_step = _restore_last_consumed_step_for_resume(
+            initial_state,
+        )
         self.lock = threading.Lock()
         self.shutdown_requested = False
         self.training_step = 0
@@ -1040,7 +1070,11 @@ class DataPreparationActor:
         if initial_state is not None:
             self.training_step = initial_state["training_step"]
             self.iter_dataloader.load_state_dict(initial_state["iter_dataloader_state"])
-            logger.info(f"[DataPreparationActor] Restored state: training_step={self.training_step}")
+            logger.info(
+                "[DataPreparationActor] Restored state: training_step=%s, last_consumed_step=%s",
+                self.training_step,
+                self._last_consumed_step,
+            )
 
         self._executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="DataPrepActor")
         self._prep_future = self._executor.submit(self._data_preparation_loop)
@@ -1341,8 +1375,10 @@ class DataPreparationActor:
         return {
             "training_step": self.current_prepared_step + 1,
             "iter_dataloader_state": self.iter_dataloader.state_dict(),
+            "last_consumed_step": self._last_consumed_step,
         }
 
     def set_state(self, state: dict):
         self.training_step = state["training_step"]
         self.iter_dataloader.load_state_dict(state["iter_dataloader_state"])
+        self._last_consumed_step = _restore_last_consumed_step_for_resume(state)

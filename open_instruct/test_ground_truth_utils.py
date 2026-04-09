@@ -4,10 +4,19 @@ Test script for verifier functionality in Python
 """
 
 import unittest
+from types import SimpleNamespace
+
+import numpy as np
 
 from parameterized import parameterized
 
-from open_instruct.ground_truth_utils import F1Verifier, PuzzleMatcherVerifier
+from open_instruct.ground_truth_utils import (
+    F1Verifier,
+    PuzzleMatcherVerifier,
+    RewardConfig,
+    VerificationResult,
+    VerifierFunction,
+)
 
 
 class TestPuzzleMatcherVerifier(unittest.TestCase):
@@ -141,6 +150,59 @@ class TestF1Verifier(unittest.TestCase):
             places=5,
             msg=f"Failed for {name}: prediction='{prediction}', labels={labels}",
         )
+
+
+class _RaisingVerifier(VerifierFunction):
+    def __init__(self):
+        super().__init__("boom", weight=1.0)
+
+    def __call__(self, tokenized_prediction, prediction, label, query=None, rollout_state=None):
+        raise ValueError("boom")
+
+
+class _ConstantVerifier(VerifierFunction):
+    def __init__(self, name="ok", score=1.0):
+        super().__init__(name, weight=1.0)
+        self.score = score
+
+    def __call__(self, tokenized_prediction, prediction, label, query=None, rollout_state=None):
+        return VerificationResult(score=self.score)
+
+
+class TestRewardConfigMetrics(unittest.IsolatedAsyncioTestCase):
+    async def test_verifiable_metrics_ignore_nan_rewards(self):
+        reward_config = RewardConfig(
+            apply_verifiable_reward=True,
+            verification_reward=10.0,
+            verifier_functions={
+                "boom": _RaisingVerifier(),
+                "ok": _ConstantVerifier(),
+            },
+        )
+        reward_fn = reward_config.build()
+        infos = SimpleNamespace(
+            timeouts=[False, False],
+            tool_errors=[False, False],
+            tool_outputs=[["ok"], ["ok"]],
+            tool_calleds=[True, True],
+            rollout_states=[{}, {}],
+        )
+
+        scores, metrics = await reward_fn(
+            responses=[[], []],
+            decoded_responses=["first", "second"],
+            ground_truths=["label-a", "label-b"],
+            datasets=["boom", "ok"],
+            finish_reasons=["stop", "stop"],
+            infos=infos,
+            queries=[None, None],
+        )
+
+        self.assertTrue(np.isnan(scores[0]))
+        self.assertEqual(scores[1], 10.0)
+        self.assertEqual(metrics["objective/verifiable_reward"], 10.0)
+        self.assertEqual(metrics["objective/verifiable_correct_rate"], 1.0)
+        self.assertEqual(metrics["objective/verifiable_nan_rate"], 0.5)
 
 
 if __name__ == "__main__":
