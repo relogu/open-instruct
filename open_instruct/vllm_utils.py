@@ -19,6 +19,7 @@ import argparse
 import asyncio
 import dataclasses
 import importlib
+import inspect
 import os
 import queue
 import socket
@@ -84,6 +85,32 @@ REQUEST_HEALTH_CHECK_ENABLED = os.environ.get("RLVR_VLLM_REQUEST_HEALTH_CHECK", 
     "yes",
     "on",
 }
+
+
+async def _init_app_state_compat(
+    engine_client: Any,
+    state: Any,
+    args: argparse.Namespace,
+) -> None:
+    signature = inspect.signature(init_app_state)
+    if len(signature.parameters) >= 4:
+        await init_app_state(engine_client, engine_client.vllm_config, state, args)
+        return
+    await init_app_state(engine_client, state, args)
+
+
+def _get_kv_cache_config_from_groups_compat(
+    vllm_config: Any,
+    kv_cache_groups: Any,
+    kv_cache_specs: Any,
+    available_memory: int,
+) -> Any:
+    signature = inspect.signature(kv_cache_utils.get_kv_cache_config_from_groups)
+    if len(signature.parameters) >= 4:
+        return kv_cache_utils.get_kv_cache_config_from_groups(
+            vllm_config, kv_cache_groups, kv_cache_specs, available_memory
+        )
+    return kv_cache_utils.get_kv_cache_config_from_groups(vllm_config, kv_cache_groups, available_memory)
 
 
 def model_dims_from_vllm_config(vllm_config: "vllm.config.VllmConfig") -> ModelDims:
@@ -971,7 +998,7 @@ class LLMRayActor:
             has_chat_template = getattr(inner_tokenizer, "chat_template", None) is not None
             args = _create_server_args(engine_client.vllm_config.model_config.model, has_chat_template)
             app = build_app(args)
-            await init_app_state(engine_client, app.state, args)
+            await _init_app_state_compat(engine_client, app.state, args)
 
             # Create a socket and bind to port 0 to let the OS assign an available port.
             # We pass the socket to serve_http to avoid race conditions where another
@@ -1222,8 +1249,8 @@ class LLMRayActor:
 
         kv_cache_groups = kv_cache_utils.get_kv_cache_groups(vllm_config, kv_cache_specs[0])
 
-        kv_cache_config = kv_cache_utils.get_kv_cache_config_from_groups(
-            vllm_config, kv_cache_groups, available_memory
+        kv_cache_config = _get_kv_cache_config_from_groups_compat(
+            vllm_config, kv_cache_groups, kv_cache_specs[0], available_memory
         )
 
         max_concurrency = kv_cache_utils.get_max_concurrency_for_kv_cache_config(vllm_config, kv_cache_config)

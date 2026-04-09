@@ -36,6 +36,7 @@ from rich.console import Console
 from rich.panel import Panel
 from rich.table import Table
 from torch.nn.parallel.distributed import DistributedDataParallel
+from transformers.integrations import deepspeed as hf_deepspeed
 
 from open_instruct import logger_utils
 from open_instruct.ground_truth_utils import VerifierFunction
@@ -218,6 +219,22 @@ def maybe_load_checkpoint(
         _load_checkpoint(checkpoint_path, device)
 
 
+@contextmanager
+def _suspend_hf_deepspeed_zero3_init():
+    active_config_ref = getattr(hf_deepspeed, "_hf_deepspeed_config_weak_ref", None)
+    active_config = active_config_ref() if active_config_ref is not None else None
+    is_zero3 = getattr(active_config, "is_zero3", None)
+    if active_config is None or not callable(is_zero3) or not is_zero3():
+        yield
+        return
+
+    hf_deepspeed.unset_hf_deepspeed_config()
+    try:
+        yield
+    finally:
+        hf_deepspeed.set_hf_deepspeed_config(active_config)
+
+
 def load_ref_policy(
     model_config: ModelConfig,
     ds_config: dict,
@@ -249,14 +266,15 @@ def load_ref_policy(
     """
     # inference model only has stage 3 (sharding) or stage 0 (no sharding)
     # stage 2 is optimizer sharding which doesn't apply to inference
-    ref_policy: transformers.PreTrainedModel = transformers.AutoModelForCausalLM.from_pretrained(
-        model_config.model_name_or_path,
-        revision=model_config.model_revision,
-        dtype=torch.bfloat16,
-        attn_implementation=model_config.attn_implementation,
-        use_cache=False,
-        **({"device_map": {"": local_rank}} if deepspeed_stage != 3 else {}),
-    )
+    with _suspend_hf_deepspeed_zero3_init():
+        ref_policy: transformers.PreTrainedModel = transformers.AutoModelForCausalLM.from_pretrained(
+            model_config.model_name_or_path,
+            revision=model_config.model_revision,
+            dtype=torch.bfloat16,
+            attn_implementation=model_config.attn_implementation,
+            use_cache=False,
+            **({"device_map": {"": local_rank}} if deepspeed_stage != 3 else {}),
+        )
     disable_dropout_in_model(ref_policy)
     ref_policy, *_ = deepspeed.initialize(model=ref_policy, config=ds_config, mpu=mpu)
     ref_policy.eval()
