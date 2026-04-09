@@ -50,6 +50,36 @@ from open_instruct.utils import combine_reward_metrics, repeat_each
 logger = logging.getLogger(__name__)
 
 
+def normalize_prompt_token_ids(payload: Any) -> list[int]:
+    """Normalize prompt payloads into raw token ids.
+
+    Some dataset transforms store ``INPUT_IDS_PROMPT_KEY`` as a tokenizer payload
+    dictionary, for example ``{"input_ids": [...], "attention_mask": [...]}``,
+    while the rollout path expects the prompt to already be a plain token-id list.
+    This helper unwraps the common structured forms and preserves the legacy
+    behavior for already-normalized lists.
+    """
+    if payload is None:
+        return []
+    if isinstance(payload, bool):
+        return [int(payload)]
+    if isinstance(payload, int):
+        return [payload]
+    if isinstance(payload, str):
+        return [int(payload)] if payload.isdigit() else []
+    if isinstance(payload, dict):
+        nested_payload = payload.get("input_ids", payload.get("ids"))
+        return normalize_prompt_token_ids(nested_payload)
+    if hasattr(payload, "tolist"):
+        return normalize_prompt_token_ids(payload.tolist())
+    if isinstance(payload, Iterable) and not isinstance(payload, (bytes, bytearray)):
+        normalized: list[int] = []
+        for item in payload:
+            normalized.extend(normalize_prompt_token_ids(item))
+        return normalized
+    return []
+
+
 def to_device(batch: dict[str, Any], device: torch.device | None) -> dict[str, Any]:
     """Move all tensors in a batch dictionary to the specified device.
 
@@ -618,7 +648,7 @@ def add_prompt_to_generator(
 
     param_prompt_Q.put(
         data_types.PromptRequest(
-            prompt=example[INPUT_IDS_PROMPT_KEY],
+            prompt=normalize_prompt_token_ids(example[INPUT_IDS_PROMPT_KEY]),
             generation_config=generation_config,
             index=index,
             prompt_id=f"{epoch_number}_{index}",
@@ -716,7 +746,7 @@ def accumulate_inference_batches(
         )
 
         example = dataset[result.index]
-        query = example[INPUT_IDS_PROMPT_KEY]
+        query = normalize_prompt_token_ids(example[INPUT_IDS_PROMPT_KEY])
         ground_truth = example[GROUND_TRUTHS_KEY]
         dataset_name = example[VERIFIER_SOURCE_KEY]
         raw_query = example[RAW_PROMPT_KEY]

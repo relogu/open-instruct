@@ -248,6 +248,32 @@ class TestGrpoFastBase(unittest.TestCase):
 
 
 class TestGrpoFastVLLM(TestGrpoFastBase):
+    def test_add_prompt_to_generator_normalizes_structured_prompt_payload(self):
+        prompt_q = ray_queue.Queue(maxsize=2)
+        self._ray_queues.append(prompt_q)
+
+        mock_generation_config = MagicMock()
+        mock_generation_config.n = 1
+
+        example = {
+            "index": 0,
+            INPUT_IDS_PROMPT_KEY: {
+                "input_ids": [11, 12, 13],
+                "attention_mask": [1, 1, 1],
+            },
+        }
+
+        data_loader_lib.add_prompt_to_generator(
+            example,
+            0,
+            prompt_q,
+            mock_generation_config,
+            False,
+        )
+
+        request = prompt_q.get()
+        self.assertEqual(request.prompt, [11, 12, 13])
+
     @parameterized.expand([(1, 16), (2, 32), (4, 64), (8, 128)])
     def test_batch_splitting_and_engine_configurations(self, vllm_num_engines: int, num_unique_prompts_rollout: int):
         """Test batch splitting and accumulation with various engine configurations."""
@@ -697,6 +723,51 @@ class TestStreamingAccumulation(TestGrpoFastBase):
 
 class TestAccumulateInferenceBatches(TestGrpoFastBase):
     """Test accumulate_inference_batches function."""
+
+    def test_accumulate_inference_batches_normalizes_structured_queries(self):
+        inference_results_q = ray_queue.Queue(maxsize=1)
+        self._ray_queues.append(inference_results_q)
+
+        mock_dataset = Dataset.from_dict(
+            {
+                INPUT_IDS_PROMPT_KEY: [
+                    {
+                        "input_ids": [1, 2, 3],
+                        "attention_mask": [1, 1, 1],
+                    }
+                ],
+                GROUND_TRUTHS_KEY: ["gt"],
+                VERIFIER_SOURCE_KEY: ["ifeval"],
+                RAW_PROMPT_KEY: ["prompt"],
+            }
+        )
+
+        inference_results_q.put(
+            self.create_mock_result(
+                0,
+                "0_0",
+                num_samples_per_prompt=2,
+                reward_scores=[0.2, 0.8],
+            )
+        )
+
+        mock_generation_config = Mock()
+        mock_generation_config.n = 2
+        tokenizer = AutoTokenizer.from_pretrained("EleutherAI/pythia-14m")
+
+        result, batch, _, _ = data_loader_lib.accumulate_inference_batches(
+            inference_results_q,
+            mock_generation_config,
+            num_prompts=1,
+            model_dims=self.create_llama7b_model_dims(),
+            tokenizer=tokenizer,
+            dataset=mock_dataset,
+        )
+
+        self.assertIsNotNone(result)
+        self.assertIsNotNone(batch)
+        assert batch is not None
+        self.assertEqual(batch.queries, [[1, 2, 3], [1, 2, 3]])
 
     def test_all_prompts_filtered_returns_none(self):
         """Test that accumulate_inference_batches returns None when all prompts are filtered."""
