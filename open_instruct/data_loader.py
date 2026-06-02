@@ -123,6 +123,17 @@ def _restore_last_consumed_step_for_resume(initial_state: dict[str, Any] | None)
     return max(restored_training_step - 1, -1)
 
 
+def _default_hf_collator(examples: list[dict[str, Any]]) -> dict[str, Any]:
+    """Preserve example indices for legacy no-collator HFDataLoader callers."""
+    if len(examples) == 1:
+        example = examples[0]
+        return example | {"index": torch.tensor([example["index"]])}
+    return {
+        "examples": examples,
+        "index": torch.tensor([example["index"] for example in examples]),
+    }
+
+
 class HFDataLoader(data_loader.DataLoaderBase):
     """A DataLoader that wraps a HuggingFace Dataset for use with olmo_core's Trainer.
 
@@ -136,14 +147,16 @@ class HFDataLoader(data_loader.DataLoaderBase):
         dataset: Dataset,
         batch_size: int,
         seed: int,
-        dp_rank: int,
-        dp_world_size: int,
-        work_dir: str,
+        dp_rank: int | None = None,
+        dp_world_size: int | None = None,
+        work_dir: str | None = None,
         automatic_reshuffle: bool = False,
         collator: Callable[[list[dict[str, Any]]], dict[str, Any]] | None = None,
         device: torch.device | None = None,
         drop_last: bool = True,
         fs_local_rank: int | None = None,
+        rank: int | None = None,
+        world_size: int | None = None,
     ) -> None:
         """Initialize the HFDataLoader.
 
@@ -152,7 +165,9 @@ class HFDataLoader(data_loader.DataLoaderBase):
             batch_size: The global batch size.
             seed: Random seed for shuffling.
             dp_rank: The rank of the current process in the distributed setup.
-            dp_world_size: Total number of data-parallel processes in the distributed setup.
+                The legacy alias ``rank`` is also accepted.
+            dp_world_size: Total number of data-parallel processes in the distributed
+                setup. The legacy alias ``world_size`` is also accepted.
             work_dir: Working directory for the data loader (required by DataLoaderBase).
             automatic_reshuffle: If True, automatically reshuffle at epoch boundaries.
             collator: Optional collation function for batching examples. If None, batches will be
@@ -167,6 +182,18 @@ class HFDataLoader(data_loader.DataLoaderBase):
             This is automatically added by get_cached_dataset_tulu(). For custom datasets,
             add it with: dataset.add_column('index', range(len(dataset)))
         """
+        if dp_rank is None:
+            dp_rank = rank
+        if dp_world_size is None:
+            dp_world_size = world_size
+        if dp_rank is None or dp_world_size is None:
+            raise TypeError(
+                "HFDataLoader requires dp_rank/dp_world_size "
+                "(or legacy rank/world_size aliases)."
+            )
+        if work_dir is None:
+            raise TypeError("HFDataLoader requires work_dir.")
+
         super().__init__(
             work_dir=work_dir,
             global_batch_size=batch_size,
@@ -194,7 +221,7 @@ class HFDataLoader(data_loader.DataLoaderBase):
                 f"The effective global batch size will be {batch_size // dp_world_size * dp_world_size}."
             )
         self._per_rank_batch_size = batch_size // dp_world_size
-        self._collator = collator if collator is not None else (lambda x: {"examples": x})
+        self._collator = collator if collator is not None else _default_hf_collator
         self._automatic_reshuffle = automatic_reshuffle
         self._drop_last = drop_last
         self._excluded_indices: set[int] = set()
@@ -232,15 +259,17 @@ class HFDataLoader(data_loader.DataLoaderBase):
             if len(batch_examples) == self._per_rank_batch_size:
                 all_examples = self._overflow + batch_examples
                 batch = to_device(self._collator(all_examples), self._device)
-                self._overflow = all_examples[len(batch["index"]) :]
+                consumed_examples = len(batch["index"]) if "index" in batch else len(all_examples)
+                self._overflow = all_examples[consumed_examples:]
                 yield batch
                 batch_examples = []
         while self._overflow:
             batch = to_device(self._collator(self._overflow), self._device)
-            assert len(batch["index"]) > 0, (
+            consumed_examples = len(batch["index"]) if "index" in batch else len(self._overflow)
+            assert consumed_examples > 0, (
                 f"Collator consumed 0 examples from {len(self._overflow)} overflow examples"
             )
-            self._overflow = self._overflow[len(batch["index"]) :]
+            self._overflow = self._overflow[consumed_examples:]
             yield batch
 
     @property
